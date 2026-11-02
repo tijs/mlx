@@ -1,5 +1,10 @@
 # MLX
 
+This [Mei](https://github.com/tijs/mei) dependency fork builds on
+[osaurus-ai/mlx](https://github.com/osaurus-ai/mlx). Its bounded Metal cache
+admits recent buffer shapes within the allowance and drops buffers that cannot
+fit. The original project documentation follows.
+
 [**Quickstart**](#quickstart) | [**Installation**](#installation) |
 [**Documentation**](https://ml-explore.github.io/mlx/build/html/index.html) |
 [**Examples**](#examples)
