@@ -132,9 +132,12 @@ TEST_CASE("safetensors mmap modes keep read-only buffers out of donation") {
   const auto path = get_temp_file("mlx-mmap-modes-donation-test.safetensors");
   const auto page = static_cast<size_t>(getpagesize());
   REQUIRE(page > 512);
-  const auto length = page - 512;
+  // Cross a page and finish in a partial EOF page. The Metal backing buffer
+  // must cover two complete pages, while tensor bounds remain logical bytes.
+  const auto length = page + 37 - 512;
   const std::string number = std::to_string(length);
-  std::string header = "{\"x\":{\"dtype\":\"U8\",\"shape\":[" + number +
+  const std::string key = "layers.0.mlp.weight";
+  std::string header = "{\"" + key + "\":{\"dtype\":\"U8\",\"shape\":[" + number +
       "],\"data_offsets\":[0," + number + "]}}";
   REQUIRE(header.size() <= 504);
   header.resize(504, ' ');
@@ -148,11 +151,13 @@ TEST_CASE("safetensors mmap modes keep read-only buffers out of donation") {
     REQUIRE(out.good());
   }
   for (bool per_tensor : {false, true}) {
+    INFO("per_tensor=" << per_tensor);
     auto result = [&]() {
       auto [tensors, metadata] = load_safetensors_excluding(path, {}, per_tensor);
-      REQUIRE(tensors.count("x") == 1);
-      auto tensor = tensors.at("x");
+      REQUIRE(tensors.count(key) == 1);
+      auto tensor = tensors.at(key);
       CHECK_FALSE(tensor.data_shared_ptr()->donatable);
+      CHECK_EQ(tensor.buffer_size(), 2 * page);
       return add(tensor, array(uint8_t{1}), Device::gpu);
     }();
     CHECK(array_equal(result, full({static_cast<int>(length)}, 43, uint8)).item<bool>());

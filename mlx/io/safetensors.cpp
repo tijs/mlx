@@ -643,7 +643,23 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     return std::nullopt;
   }
   const auto file_size = static_cast<size_t>(st.st_size);
-  void* raw = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+  const auto page = static_cast<size_t>(getpagesize());
+  auto round_to_page = [page](size_t size) -> std::optional<size_t> {
+    const auto remainder = size % page;
+    const auto padding = remainder == 0 ? 0 : page - remainder;
+    if (padding > std::numeric_limits<size_t>::max() - size) {
+      return std::nullopt;
+    }
+    return size + padding;
+  };
+  const auto whole_map_size = tensor_buffers ? std::optional<size_t>(file_size)
+                                             : round_to_page(file_size);
+  if (!whole_map_size) {
+    close_fd();
+    log("mapping-size-overflow");
+    return std::nullopt;
+  }
+  void* raw = mmap(nullptr, *whole_map_size, PROT_READ, MAP_SHARED, fd, 0);
   if (raw == MAP_FAILED) {
     close_fd();
     log("mmap-failed");
@@ -655,7 +671,7 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
 
   auto unmap_on_failure = [&]() {
     if (raw && raw != MAP_FAILED) {
-      munmap(raw, file_size);
+      munmap(raw, *whole_map_size);
       raw = nullptr;
     }
     close_fd();
@@ -695,14 +711,14 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
   std::shared_ptr<MmapShard> shard;
   std::optional<array> base_array;
   if (!tensor_buffers) {
-    shard = std::make_shared<MmapShard>(raw, file_size, file);
+    shard = std::make_shared<MmapShard>(raw, *whole_map_size, file);
     raw = nullptr;
-    auto buffer = allocator::make_buffer(shard->base, file_size);
+    auto buffer = allocator::make_buffer(shard->base, *whole_map_size);
     if (buffer.ptr() == nullptr) {
       log("make-buffer-failed");
       return std::nullopt;
     }
-    shard->tracked_buffer_bytes = file_size;
+    shard->tracked_buffer_bytes = *whole_map_size;
     base_array.emplace(
         buffer, Shape{1}, uint8, [shard](allocator::Buffer buffer) {
           allocator::release(buffer);
@@ -789,18 +805,22 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     const bool tensor_is_mmap_backed = tensor_offset % size_of(type) == 0;
     std::optional<array> tensor;
     if (tensor_buffers) {
-      const auto page = static_cast<size_t>(getpagesize());
-      const auto aligned_start = tensor_offset & ~(page - 1);
+      const auto aligned_start = tensor_offset - tensor_offset % page;
       const auto aligned_end = tensor_offset + tensor_length;
       if (aligned_end <= aligned_start || aligned_end > file_size) {
         log("tensor-buffer-span-invalid");
         unmap_on_failure();
         return std::nullopt;
       }
-      const auto span = aligned_end - aligned_start;
+      const auto span = round_to_page(aligned_end - aligned_start);
+      if (!span) {
+        log("tensor-buffer-span-overflow");
+        unmap_on_failure();
+        return std::nullopt;
+      }
       void* tensor_raw = mmap(
           nullptr,
-          span,
+          *span,
           PROT_READ,
           MAP_SHARED,
           fd,
@@ -810,15 +830,15 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
         unmap_on_failure();
         return std::nullopt;
       }
-      auto tensor_shard = std::make_shared<MmapShard>(tensor_raw, span, file);
-      auto buffer = allocator::make_buffer(tensor_shard->base, span);
+      auto tensor_shard = std::make_shared<MmapShard>(tensor_raw, *span, file);
+      auto buffer = allocator::make_buffer(tensor_shard->base, *span);
       if (buffer.ptr() == nullptr) {
         tensor_shard.reset();
         log("tensor-buffer-make-buffer-failed");
         unmap_on_failure();
         return std::nullopt;
       }
-      tensor_shard->tracked_buffer_bytes = span;
+      tensor_shard->tracked_buffer_bytes = *span;
       array tensor_base(
           buffer, Shape{1}, uint8, [tensor_shard](allocator::Buffer buffer) {
             allocator::release(buffer);
