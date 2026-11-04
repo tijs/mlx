@@ -18,7 +18,7 @@ std::string get_temp_file(const std::string& name) {
 
 #ifndef _WIN32
 TEST_CASE("mmap region preserves an unaligned EOF slice on Metal") {
-  if (!gpu::is_available()) {
+  if (!metal::is_available()) {
     return;
   }
   const auto path = get_temp_file("mlx-mmap-region-alignment-test.bin");
