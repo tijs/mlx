@@ -707,6 +707,7 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
         buffer, Shape{1}, uint8, [shard](allocator::Buffer buffer) {
           allocator::release(buffer);
         });
+    base_array->data_shared_ptr()->donatable = false;
   }
 
   const size_t data_start = static_cast<size_t>(json_header_length) + 8;
@@ -822,6 +823,7 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
           buffer, Shape{1}, uint8, [tensor_shard](allocator::Buffer buffer) {
             allocator::release(buffer);
           });
+      tensor_base.data_shared_ptr()->donatable = false;
       tensor = tensor_from_mmap(
           tensor_base,
           shape,
@@ -1085,6 +1087,7 @@ array mmap_file_region(
       Shape{1},
       uint8,
       [shard](allocator::Buffer buffer) { allocator::release(buffer); });
+  base.data_shared_ptr()->donatable = false;
   array tensor(
       allocator::Buffer(nullptr), shape, dtype, [](allocator::Buffer) {});
   tensor.copy_shared_buffer(

@@ -36,16 +36,71 @@ TEST_CASE("mmap region preserves an unaligned EOF slice on Metal") {
       mmap_file_region(path, 0, 1, {std::numeric_limits<int32_t>::max(),
           std::numeric_limits<int32_t>::max(), 16}, uint8),
       "[mmap_file_region] shape byte count overflow.");
+  void* mapped_buffer = nullptr;
   auto result = [&]() {
     auto region = mmap_file_region(path, 4, bytes.size() - 4, {12341}, uint8);
-    return add(region, array(1, uint8), Device::gpu);
+    mapped_buffer = region.buffer().ptr();
+    CHECK_EQ(region.data<uint8_t>()[0], 4);
+    CHECK_FALSE(region.is_donatable());
+    CHECK_FALSE(array::unsafe_weak_copy(region).is_donatable());
+    CHECK_EQ(array(uint8_t{1}).item<uint8_t>(), 1);
+    return add(region, array(uint8_t{1}), Device::gpu);
   }();
   std::filesystem::remove(path);
   std::vector<uint8_t> expected(bytes.begin() + 4, bytes.end());
   for (auto& value : expected) {
     ++value;
   }
+  auto control = add(array(bytes.data() + 4, {12341}, uint8), array(uint8_t{1}), Device::gpu);
+  CHECK(array_equal(control, array(expected.data(), {12341}, uint8)).item<bool>());
+  result.eval();
+  CHECK_NE(result.buffer().ptr(), mapped_buffer);
+  INFO("result dtype=" << result.dtype() << " first bytes="
+       << static_cast<int>(result.data<uint8_t>()[0]) << ","
+       << static_cast<int>(result.data<uint8_t>()[1]) << ","
+       << static_cast<int>(result.data<uint8_t>()[2]));
+  for (size_t i = 0; i < expected.size(); ++i) {
+    if (result.data<uint8_t>()[i] != expected[i]) {
+      INFO("first mismatch index=" << i << " actual="
+           << static_cast<int>(result.data<uint8_t>()[i]) << " expected="
+           << static_cast<int>(expected[i]));
+      CHECK(false);
+      break;
+    }
+  }
   CHECK(array_equal(result, array(expected.data(), {12341}, uint8)).item<bool>());
+}
+
+TEST_CASE("mmap views cannot be donated to compiled or CPU output") {
+  if (!metal::is_available()) {
+    return;
+  }
+  const auto path = get_temp_file("mlx-mmap-region-view-test.bin");
+  std::vector<uint8_t> bytes(4096, 42);
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    REQUIRE(out.good());
+  }
+  auto compiled = compile([](const std::vector<array>& inputs) {
+    return std::vector<array>{add(inputs[0], array(uint8_t{1}), Device::gpu)};
+  });
+  auto gpu_result = [&]() {
+    auto region = mmap_file_region(path, 0, bytes.size(), {4096}, uint8);
+    auto view = reshape(region, {64, 64}, Device::gpu);
+    return compiled({view})[0];
+  }();
+  auto cpu_result = [&]() {
+    auto region = mmap_file_region(path, 0, bytes.size(), {4096}, uint8);
+    return add(region, array(uint8_t{1}), Device::cpu);
+  }();
+  CHECK(array_equal(gpu_result, full({64, 64}, 43, uint8)).item<bool>());
+  CHECK(array_equal(cpu_result, full({4096}, 43, uint8)).item<bool>());
+  std::ifstream in(path, std::ios::binary);
+  std::vector<uint8_t> actual(bytes.size());
+  in.read(reinterpret_cast<char*>(actual.data()), actual.size());
+  CHECK(actual == bytes);
+  std::filesystem::remove(path);
 }
 #endif
 

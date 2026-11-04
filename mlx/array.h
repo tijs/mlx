@@ -231,12 +231,14 @@ class MLX_API array {
   struct Data {
     allocator::Buffer buffer;
     Deleter d;
+    // Shared views inherit this property from their backing allocation.
+    bool donatable = true;
     Data(allocator::Buffer buffer, Deleter d = allocator::free)
         : buffer(buffer), d(d) {}
     // Not copyable
     Data(const Data& d) = delete;
     Data& operator=(const Data& d) = delete;
-    Data(Data&& o) : buffer(o.buffer), d(o.d) {
+    Data(Data&& o) : buffer(o.buffer), d(o.d), donatable(o.donatable) {
       o.buffer = allocator::Buffer(nullptr);
       o.d = [](allocator::Buffer) {};
     }
@@ -292,7 +294,8 @@ class MLX_API array {
 
   /** True indicates the arrays buffer is safe to reuse */
   bool is_donatable() const {
-    return array_desc_.use_count() == 1 && (array_desc_->data.use_count() == 1);
+    return array_desc_.use_count() == 1 && array_desc_->data.use_count() == 1 &&
+        array_desc_->data->donatable;
   }
 
   /** The array's siblings. */
