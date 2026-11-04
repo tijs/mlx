@@ -1,10 +1,15 @@
 // Copyright © 2023 Apple Inc.
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "doctest/doctest.h"
 
@@ -100,6 +105,64 @@ TEST_CASE("mmap views cannot be donated to compiled or CPU output") {
   std::vector<uint8_t> actual(bytes.size());
   in.read(reinterpret_cast<char*>(actual.data()), actual.size());
   CHECK(actual == bytes);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("safetensors mmap modes keep read-only buffers out of donation") {
+  if (!metal::is_available()) {
+    return;
+  }
+  struct EnvironmentRestore {
+    const char* name;
+    std::optional<std::string> value;
+    explicit EnvironmentRestore(const char* name) : name(name) {
+      if (const auto* old = std::getenv(name)) {
+        value = old;
+      }
+    }
+    ~EnvironmentRestore() {
+      if (value) {
+        setenv(name, value->c_str(), 1);
+      } else {
+        unsetenv(name);
+      }
+    }
+  } restore("MLX_SAFETENSORS_MMAP");
+  REQUIRE(setenv("MLX_SAFETENSORS_MMAP", "1", 1) == 0);
+  const auto path = get_temp_file("mlx-mmap-modes-donation-test.safetensors");
+  const auto page = static_cast<size_t>(getpagesize());
+  REQUIRE(page > 512);
+  const auto length = page - 512;
+  const std::string number = std::to_string(length);
+  std::string header = "{\"x\":{\"dtype\":\"U8\",\"shape\":[" + number +
+      "],\"data_offsets\":[0," + number + "]}}";
+  REQUIRE(header.size() <= 504);
+  header.resize(504, ' ');
+  const uint64_t header_length = header.size();
+  std::vector<uint8_t> payload(length, 42);
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&header_length), sizeof(header_length));
+    out.write(header.data(), header.size());
+    out.write(reinterpret_cast<const char*>(payload.data()), payload.size());
+    REQUIRE(out.good());
+  }
+  for (bool per_tensor : {false, true}) {
+    auto result = [&]() {
+      auto [tensors, metadata] = load_safetensors_excluding(path, {}, per_tensor);
+      REQUIRE(tensors.count("x") == 1);
+      auto tensor = tensors.at("x");
+      CHECK_FALSE(tensor.data_shared_ptr()->donatable);
+      return add(tensor, array(uint8_t{1}), Device::gpu);
+    }();
+    CHECK(array_equal(result, full({static_cast<int>(length)}, 43, uint8)).item<bool>());
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(512);
+    std::vector<uint8_t> actual(length);
+    in.read(reinterpret_cast<char*>(actual.data()), actual.size());
+    CHECK(in.good());
+    CHECK(actual == payload);
+  }
   std::filesystem::remove(path);
 }
 #endif
