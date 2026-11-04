@@ -8,12 +8,14 @@
 #include <stdexcept>
 #include <vector>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
 #include "doctest/doctest.h"
 
 #include "mlx/mlx.h"
+#include "mlx/io/load.h"
 
 using namespace mlx::core;
 
@@ -168,6 +170,11 @@ TEST_CASE("safetensors mmap modes keep read-only buffers out of donation") {
     CHECK(in.good());
     CHECK(actual == payload);
   }
+  auto [reader_tensors, reader_metadata] =
+      load_safetensors(std::make_shared<io::ParallelFileReader>(path));
+  REQUIRE(reader_tensors.count(key) == 1);
+  CHECK(array_equal(reader_tensors.at(key),
+                    full({static_cast<int>(length)}, 42, uint8)).item<bool>());
   std::filesystem::remove(path);
 }
 #endif
@@ -209,6 +216,63 @@ void write_raw_safetensors(
   out.write(json_header.data(), json_header.size());
   out.write(data.data(), data.size());
 }
+
+#ifndef _WIN32
+TEST_CASE("safetensors rejects malformed tensor metadata in all loaders") {
+  const auto path = get_temp_file("mlx-safetensors-invalid-metadata-test.safetensors");
+  const auto* old_env = std::getenv("MLX_SAFETENSORS_MMAP");
+  const auto previous = old_env ? std::optional<std::string>(old_env) : std::nullopt;
+  struct RestoreEnv {
+    std::optional<std::string> value;
+    ~RestoreEnv() {
+      if (value) setenv("MLX_SAFETENSORS_MMAP", value->c_str(), 1);
+      else unsetenv("MLX_SAFETENSORS_MMAP");
+    }
+  } restore{previous};
+  REQUIRE(setenv("MLX_SAFETENSORS_MMAP", "1", 1) == 0);
+  const std::vector<std::string> bad_headers = {
+      R"({"x":{"dtype":"U8","shape":[1],"data_offsets":[18446744073709551615,18446744073709551615]}})",
+      R"({"x":{"dtype":"U8","shape":[-1],"data_offsets":[0,1]}})",
+      R"({"x":{"dtype":"U8","shape":[4294967296],"data_offsets":[0,1]}})",
+      R"({"x":{"dtype":"U8","shape":[2147483647,2147483647,8],"data_offsets":[0,1]}})",
+      R"({"x":{"dtype":"U8","shape":[0,2147483647,2147483647,8],"data_offsets":[0,0]}})",
+      R"({"x":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}})",
+      R"({"x":{"dtype":"U8","shape":[1],"data_offsets":[-1,0]}})",
+      R"({"x":{"dtype":"U8","shape":[1],"data_offsets":[0,2]}})",
+      R"({"x":{"dtype":"U8","shape":[1],"data_offsets":[0,"bad"]}})",
+      R"({"x":{"dtype":"U8","shape":[true],"data_offsets":[0,1]}})",
+      R"({"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1.0]}})",
+      R"({"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"z":{"dtype":"U8","shape":[2],"data_offsets":[0,1]}})",
+  };
+  auto fd_count = []() {
+    int count = 0;
+    for (int fd = 0; fd < getdtablesize(); ++fd) {
+      if (fcntl(fd, F_GETFD) != -1) ++count;
+    }
+    return count;
+  };
+  // Initialize Metal before comparing descriptor counts.
+  (void)metal::is_available();
+  const int descriptors_before = fd_count();
+  for (const auto& header : bad_headers) {
+    write_raw_safetensors(path, header, {'a'});
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      for (bool per_tensor : {false, true}) {
+        CHECK_THROWS(load_safetensors_excluding(path, {}, per_tensor));
+      }
+      CHECK_THROWS(load_safetensors(std::make_shared<io::ParallelFileReader>(path)));
+    }
+  }
+  CHECK_EQ(fd_count(), descriptors_before);
+  write_raw_safetensors(path, R"({"x":{"dtype":"U8","shape":[0],"data_offsets":[0,0]}})", {});
+  for (bool per_tensor : {false, true}) {
+    auto [tensors, metadata] = load_safetensors_excluding(path, {}, per_tensor);
+    REQUIRE(tensors.count("x") == 1);
+    CHECK_EQ(tensors.at("x").size(), 0);
+  }
+  std::filesystem::remove(path);
+}
+#endif
 
 TEST_CASE("test safetensors file boundary validation") {
   // Test that loading a safetensors file where data_offsets extend beyond the

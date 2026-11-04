@@ -128,6 +128,73 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
   }
 }
 
+namespace {
+
+struct ValidatedSafetensor {
+  Shape shape;
+  Dtype dtype;
+  size_t offset;
+  size_t length;
+};
+
+uint64_t safetensor_nonnegative_integer(const json& value) {
+  if (value.is_number_unsigned()) {
+    return value.get<uint64_t>();
+  }
+  if (value.is_number_integer()) {
+    const auto signed_value = value.get<int64_t>();
+    if (signed_value >= 0) {
+      return static_cast<uint64_t>(signed_value);
+    }
+  }
+  throw std::runtime_error("[load_safetensors] Expected a nonnegative integer.");
+}
+
+ValidatedSafetensor validate_safetensor(
+    const json& entry, size_t data_start, size_t file_size) {
+  const auto dtype = dtype_from_safetensor_str(entry.at("dtype").get<std::string>());
+  const auto& dims = entry.at("shape");
+  const auto& offsets = entry.at("data_offsets");
+  if (!dims.is_array() || dims.size() > static_cast<size_t>(INT32_MAX) ||
+      !offsets.is_array() || offsets.size() != 2 || data_start > file_size) {
+    throw std::runtime_error("[load_safetensors] Invalid shape or offsets.");
+  }
+  Shape shape;
+  shape.reserve(dims.size());
+  for (const auto& dim : dims) {
+    const auto value = safetensor_nonnegative_integer(dim);
+    if (value > static_cast<uint64_t>(std::numeric_limits<ShapeElem>::max())) {
+      throw std::runtime_error("[load_safetensors] Shape dimension out of range.");
+    }
+    shape.push_back(static_cast<ShapeElem>(value));
+  }
+  // ArrayDesc calculates strides from right to left, including for empty
+  // arrays. Check every intermediate so a zero dimension cannot hide overflow.
+  size_t elements = 1;
+  constexpr auto max_stride = static_cast<size_t>(std::numeric_limits<int64_t>::max());
+  for (auto it = shape.rbegin(); it != shape.rend(); ++it) {
+    const auto dim = static_cast<size_t>(*it);
+    if (dim != 0 && elements > max_stride / dim) {
+      throw std::runtime_error("[load_safetensors] Shape size overflow.");
+    }
+    elements *= dim;
+  }
+  if (elements > std::numeric_limits<size_t>::max() / size_of(dtype)) {
+    throw std::runtime_error("[load_safetensors] Tensor byte count overflow.");
+  }
+  const auto first = safetensor_nonnegative_integer(offsets[0]);
+  const auto last = safetensor_nonnegative_integer(offsets[1]);
+  if (first > last || last > file_size - data_start ||
+      data_start > max_stride || first > max_stride - data_start ||
+      last - first != elements * size_of(dtype)) {
+    throw std::runtime_error("[load_safetensors] Invalid tensor byte range.");
+  }
+  return {std::move(shape), dtype, data_start + static_cast<size_t>(first),
+          static_cast<size_t>(last - first)};
+}
+
+} // namespace
+
 #ifndef _WIN32
 namespace {
 
@@ -258,6 +325,17 @@ struct MmapShard {
   ~MmapShard() {
     if (base && base != MAP_FAILED && size > 0) {
       munmap(base, size);
+    }
+  }
+};
+
+// Own a no-copy Metal buffer until an array's Data takes responsibility for it.
+struct MmapBufferGuard {
+  allocator::Buffer buffer;
+  bool transferred = false;
+  ~MmapBufferGuard() {
+    if (!transferred) {
+      allocator::release(buffer);
     }
   }
 };
@@ -665,6 +743,19 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     log("mmap-failed");
     return std::nullopt;
   }
+  struct HeaderMappingGuard {
+    void*& mapping;
+    int& fd;
+    size_t length;
+    ~HeaderMappingGuard() {
+      if (mapping && mapping != MAP_FAILED) {
+        munmap(mapping, length);
+      }
+      if (fd >= 0) {
+        close(fd);
+      }
+    }
+  } header_guard{raw, fd, *whole_map_size};
   if (!tensor_buffers) {
     close_fd();
   }
@@ -718,11 +809,13 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
       log("make-buffer-failed");
       return std::nullopt;
     }
+    MmapBufferGuard buffer_guard{buffer};
     shard->tracked_buffer_bytes = *whole_map_size;
     base_array.emplace(
         buffer, Shape{1}, uint8, [shard](allocator::Buffer buffer) {
           allocator::release(buffer);
         });
+    buffer_guard.transferred = true;
     base_array->data_shared_ptr()->donatable = false;
   }
 
@@ -762,9 +855,16 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     // same shard remain zero-copy mmap-backed.  This bounds the unavoidable
     // repair to malformed payloads instead of materializing the entire shard.
     auto aligned = allocator::malloc(byte_length);
-    if (aligned.ptr() == nullptr || aligned.raw_ptr() == nullptr) {
+    if (aligned.ptr() == nullptr) {
       throw std::runtime_error(
           "[safetensor] failed to allocate aligned buffer for unaligned mmap tensor");
+    }
+    auto free_aligned = [aligned](void*) { allocator::free(aligned); };
+    std::unique_ptr<void, decltype(free_aligned)> aligned_owner(
+        aligned.ptr(), free_aligned);
+    if (aligned.raw_ptr() == nullptr) {
+      throw std::runtime_error(
+          "[safetensor] aligned buffer is not CPU accessible");
     }
     std::memcpy(
         aligned.raw_ptr(),
@@ -772,7 +872,9 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
         byte_length);
     realigned_tensor_count += 1;
     realigned_tensor_bytes += byte_length;
-    return array(aligned, shape, type);
+    array result(aligned, shape, type);
+    aligned_owner.release();
+    return result;
   };
   for (const auto& item : metadata.items()) {
     if (item.key() == "__metadata__") {
@@ -785,21 +887,14 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
       continue;
     }
 
-    const std::string& dtype = item.value().at("dtype");
-    const Shape& shape = item.value().at("shape");
-    const std::vector<size_t>& data_offsets = item.value().at("data_offsets");
-    if (data_offsets.size() != 2 || data_offsets[1] < data_offsets[0]) {
+    const auto validated = validate_safetensor(item.value(), data_start, file_size);
+    const auto& shape = validated.shape;
+    const auto type = validated.dtype;
+    const auto tensor_offset = validated.offset;
+    const auto tensor_length = validated.length;
+    if (tensor_length == 0) {
+      // The reader supports empty arrays; they cannot form a Metal buffer.
       unmap_on_failure();
-      log("invalid-data-offsets");
-      return std::nullopt;
-    }
-
-    Dtype type = dtype_from_safetensor_str(dtype);
-    const auto tensor_offset = data_start + data_offsets[0];
-    const auto tensor_length = data_offsets[1] - data_offsets[0];
-    if (tensor_offset > file_size ||
-        tensor_length > file_size - tensor_offset) {
-      log("tensor-out-of-bounds");
       return std::nullopt;
     }
     const bool tensor_is_mmap_backed = tensor_offset % size_of(type) == 0;
@@ -830,7 +925,11 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
         unmap_on_failure();
         return std::nullopt;
       }
+      auto unmap_tensor = [size = *span](void* ptr) { munmap(ptr, size); };
+      std::unique_ptr<void, decltype(unmap_tensor)> tensor_owner(
+          tensor_raw, unmap_tensor);
       auto tensor_shard = std::make_shared<MmapShard>(tensor_raw, *span, file);
+      tensor_owner.release();
       auto buffer = allocator::make_buffer(tensor_shard->base, *span);
       if (buffer.ptr() == nullptr) {
         tensor_shard.reset();
@@ -838,11 +937,13 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
         unmap_on_failure();
         return std::nullopt;
       }
+      MmapBufferGuard buffer_guard{buffer};
       tensor_shard->tracked_buffer_bytes = *span;
       array tensor_base(
           buffer, Shape{1}, uint8, [tensor_shard](allocator::Buffer buffer) {
             allocator::release(buffer);
           });
+      buffer_guard.transferred = true;
       tensor_base.data_shared_ptr()->donatable = false;
       tensor = tensor_from_mmap(
           tensor_base,
@@ -1095,18 +1196,22 @@ array mmap_file_region(
     throw std::runtime_error("[mmap_file_region] mmap failed: " + file);
   }
 
-  auto shard =
-      std::make_shared<MmapShard>(raw, mapped_length, file);
+  auto unmap_region = [mapped_length](void* ptr) { munmap(ptr, mapped_length); };
+  std::unique_ptr<void, decltype(unmap_region)> region_owner(raw, unmap_region);
+  auto shard = std::make_shared<MmapShard>(raw, mapped_length, file);
+  region_owner.release();
   auto buffer = allocator::make_buffer(shard->base, mapped_length);
   if (buffer.ptr() == nullptr) {
     throw std::runtime_error("[mmap_file_region] make_buffer failed: " + file);
   }
+  MmapBufferGuard buffer_guard{buffer};
   shard->tracked_buffer_bytes = mapped_length;
   array base(
       buffer,
       Shape{1},
       uint8,
       [shard](allocator::Buffer buffer) { allocator::release(buffer); });
+  buffer_guard.transferred = true;
   base.data_shared_ptr()->donatable = false;
   array tensor(
       allocator::Buffer(nullptr), shape, dtype, [](allocator::Buffer) {});
@@ -1186,47 +1291,14 @@ SafetensorsLoad load_safetensors(
     if (excluded_keys && excluded_keys->count(item.key()) != 0) {
       continue;
     }
-    const std::string& dtype = item.value().at("dtype");
-    const Shape& shape = item.value().at("shape");
-    const std::vector<size_t>& data_offsets = item.value().at("data_offsets");
-    Dtype type = dtype_from_safetensor_str(dtype);
-    if (data_offsets.size() != 2) {
-      std::ostringstream msg;
-      msg << "[load_safetensors] Tensor '" << item.key()
-          << "' data_offsets must have exactly 2 entries but has "
-          << data_offsets.size();
-      throw std::runtime_error(msg.str());
-    }
-    {
-      size_t expected_nbytes = type.size();
-      for (auto dim : shape) {
-        expected_nbytes *= static_cast<size_t>(dim);
-      }
-      if (data_offsets[1] < data_offsets[0] ||
-          data_offsets[1] - data_offsets[0] != expected_nbytes) {
-        std::ostringstream msg;
-        msg << "[load_safetensors] Tensor '" << item.key()
-            << "' invalid data offsets (" << data_offsets[0] << ", "
-            << data_offsets[1] << "). Expecting " << expected_nbytes
-            << " bytes.";
-        throw std::runtime_error(msg.str());
-      }
-    }
-    if (offset + data_offsets[1] > file_size) {
-      std::ostringstream msg;
-      msg << "[load_safetensors] Tensor '" << item.key()
-          << "' invalid data offsets (" << data_offsets[0] << ", "
-          << data_offsets[1] << ") exceeding the size of the file. "
-          << "Perhaps an incomplete download or corrupt file?";
-      throw std::runtime_error(msg.str());
-    }
+    const auto validated = validate_safetensor(item.value(), offset, file_size);
     res.insert(
         {item.key(),
          array(
-             shape,
-             type,
+             validated.shape,
+             validated.dtype,
              std::make_shared<Load>(
-                 stream, in_stream, offset + data_offsets.at(0), false),
+                 stream, in_stream, validated.offset, false),
              std::vector<array>{})});
   }
   return {res, metadata_map};
