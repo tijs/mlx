@@ -1005,6 +1005,10 @@ array mmap_file_region(
       throw std::runtime_error(
           "[mmap_file_region] shape contains negative dim.");
     }
+    if (dim != 0 && expected_length >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      throw std::runtime_error("[mmap_file_region] shape byte count overflow.");
+    }
     expected_length *= static_cast<size_t>(dim);
   }
   if (expected_length != length) {
@@ -1036,21 +1040,30 @@ array mmap_file_region(
 
   const auto item_size = static_cast<uint64_t>(size_of(dtype));
   const auto page = static_cast<uint64_t>(getpagesize());
-  const auto aligned_start = offset & ~(page - 1);
+  const auto aligned_start = offset - offset % page;
   const auto offset_delta = offset - aligned_start;
   if (offset_delta % item_size != 0) {
     close_fd();
     throw std::runtime_error("[mmap_file_region] dtype-unaligned offset.");
   }
-  const auto span = offset_delta + static_cast<uint64_t>(length);
-  if (span > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+  const auto max_size =
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+  if (static_cast<uint64_t>(length) > max_size - offset_delta) {
     close_fd();
     throw std::runtime_error("[mmap_file_region] span too large.");
   }
+  const auto span = offset_delta + static_cast<uint64_t>(length);
+  const auto remainder = span % page;
+  const auto padding = remainder == 0 ? 0 : page - remainder;
+  if (padding > max_size - span) {
+    close_fd();
+    throw std::runtime_error("[mmap_file_region] aligned span too large.");
+  }
+  const auto mapped_length = static_cast<size_t>(span + padding);
 
   void* raw = mmap(
       nullptr,
-      static_cast<size_t>(span),
+      mapped_length,
       PROT_READ,
       MAP_SHARED,
       fd,
@@ -1061,15 +1074,15 @@ array mmap_file_region(
   }
 
   auto shard =
-      std::make_shared<MmapShard>(raw, static_cast<size_t>(span), file);
-  auto buffer = allocator::make_buffer(shard->base, static_cast<size_t>(span));
+      std::make_shared<MmapShard>(raw, mapped_length, file);
+  auto buffer = allocator::make_buffer(shard->base, mapped_length);
   if (buffer.ptr() == nullptr) {
     throw std::runtime_error("[mmap_file_region] make_buffer failed: " + file);
   }
-  shard->tracked_buffer_bytes = static_cast<size_t>(span);
+  shard->tracked_buffer_bytes = mapped_length;
   array base(
       buffer,
-      Shape{static_cast<ShapeElem>(span)},
+      Shape{1},
       uint8,
       [shard](allocator::Buffer buffer) { allocator::release(buffer); });
   array tensor(

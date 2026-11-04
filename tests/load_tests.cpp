@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -14,6 +15,39 @@ using namespace mlx::core;
 std::string get_temp_file(const std::string& name) {
   return std::filesystem::temp_directory_path().append(name).string();
 }
+
+#ifndef _WIN32
+TEST_CASE("mmap region preserves an unaligned EOF slice on Metal") {
+  if (!gpu::is_available()) {
+    return;
+  }
+  const auto path = get_temp_file("mlx-mmap-region-alignment-test.bin");
+  std::vector<uint8_t> bytes(12345);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    bytes[i] = static_cast<uint8_t>(i % 251);
+  }
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    REQUIRE(out.good());
+  }
+  CHECK_THROWS_AS(mmap_file_region(path, 4, bytes.size(), {12345}, uint8), std::runtime_error);
+  CHECK_THROWS_WITH(
+      mmap_file_region(path, 0, 1, {std::numeric_limits<int32_t>::max(),
+          std::numeric_limits<int32_t>::max(), 16}, uint8),
+      "[mmap_file_region] shape byte count overflow.");
+  auto result = [&]() {
+    auto region = mmap_file_region(path, 4, bytes.size() - 4, {12341}, uint8);
+    return add(region, array(1, uint8), Device::gpu);
+  }();
+  std::filesystem::remove(path);
+  std::vector<uint8_t> expected(bytes.begin() + 4, bytes.end());
+  for (auto& value : expected) {
+    ++value;
+  }
+  CHECK(array_equal(result, array(expected.data(), {12341}, uint8)).item<bool>());
+}
+#endif
 
 TEST_CASE("test save_safetensors") {
   std::string file_path = get_temp_file("test_arr.safetensors");
