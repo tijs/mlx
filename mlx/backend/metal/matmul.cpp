@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "mlx/backend/common/broadcasting.h"
+#include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/binary.h"
@@ -208,11 +209,25 @@ void steel_matmul_regular_axpby_nax(
 
   // Temp routing for larger devices
   char devc = d.get_architecture().back();
-  if (devc == 's' || devc == 'c' || devc == 'd') {
+  if (devc == 's' || devc == 'c') {
     bk = (K >= 8192 && K > (M + N)) ? 64 : 256;
 
     bm = 64;
     wm = 2;
+  } else if (devc == 'd') {
+    if (N > M) {
+      bm = 128;
+      bn = 64;
+
+      wm = 4;
+      wn = 2;
+    } else {
+      bm = 64;
+      bn = 128;
+
+      wm = 2;
+      wn = 4;
+    }
   }
 
   // Prepare kernel name
@@ -279,8 +294,10 @@ void steel_matmul_regular_axpby_nax(
 
   // TODO: Explore device-based tuning for swizzle
   int swizzle_log = tm <= 3 ? 0 : 1;
-  if (devc == 's' || devc == 'c' || devc == 'd') {
+  if (devc == 's' || devc == 'c') {
     swizzle_log = 2;
+  } else if (devc == 'd') {
+    swizzle_log = (M > N) ? 0 : 2;
   }
 
   // Prepare steel matmul params
@@ -517,7 +534,8 @@ void steel_gemm_splitk_axpby(
     bool transpose_b,
     std::vector<array>& copies,
     float alpha = 1.0f,
-    float beta = 0.0f) {
+    float beta = 0.0f,
+    const std::vector<std::pair<int64_t, int64_t>>& batch_offsets = {}) {
   using namespace mlx::steel;
 
   int _tm = (M + 32 - 1) / 32;
@@ -532,6 +550,12 @@ void steel_gemm_splitk_axpby(
   // As _tk grows use more partitions, as _tm * _tn grow use fewer partitions
   int split_k_partitions =
       std::min(std::max(2, next_power_of_2(_tk / (_tm * _tn))), 32);
+  if (!batch_offsets.empty()) {
+    // Keep each long reduction near 4096 elements using the existing FP32
+    // partial/accumulation kernels. The final partition handles K's remainder.
+    split_k_partitions = std::max(
+        split_k_partitions, std::min(32, next_power_of_2(ceildiv(K, 4096))));
+  }
   int split_k_partition_stride = M * N;
   int gemm_k_iterations = (K / bk) / split_k_partitions;
   int split_k_partition_size = gemm_k_iterations * bk;
@@ -576,78 +600,87 @@ void steel_gemm_splitk_axpby(
       /* bool mn_aligned = */ mn_aligned,
       /* bool k_aligned = */ k_aligned);
 
-  compute_encoder.set_compute_pipeline_state(kernel);
-
-  int tn = (N + bn - 1) / bn;
-  int tm = (M + bm - 1) / bm;
-
-  GEMMSpiltKParams params{
-      /* const int M = */ M,
-      /* const int N = */ N,
-      /* const int K = */ K,
-      /* const int lda = */ lda,
-      /* const int ldb = */ ldb,
-      /* const int ldc = */ N,
-      /* const int tiles_n = */ tn,
-      /* const int tiles_m = */ tm,
-      /* const int split_k_partitions = */ split_k_partitions,
-      /* const int split_k_partition_stride = */ split_k_partition_stride,
-      /* const int split_k_partition_size = */ split_k_partition_size,
-      /* const int swizzle_log = */ 0, // no swizzle
-      /* const int gemm_k_iterations_aligned = */ gemm_k_iterations};
-
-  MTL::Size group_dims = MTL::Size(32, wn, wm);
-  MTL::Size grid_dims = MTL::Size(tn, tm, split_k_partitions);
-
-  compute_encoder.set_input_array(a, 0);
-  compute_encoder.set_input_array(b, 1);
-  compute_encoder.set_output_array(C_split, 2);
-
-  compute_encoder.set_bytes(params, 3);
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
-
-  // Do accum kernel
-  {
-    const bool do_axpby = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
-
-    auto kernel_name = "steel_gemm_splitk_accum_" + type_to_name(out) + "_" +
-        type_to_name(C_split);
-
-    if (do_axpby) {
-      kernel_name = kernel_name + "_axbpy";
-    }
-
-    auto kernel = get_steel_gemm_splitk_accum_kernel(
-        /* metal::Device& d = */ d,
-        /* const std::string& kernel_name = */ kernel_name,
-        /* const array& in = */ C_split,
-        /* const array& out = */ out,
-        /* bool axbpy = */ do_axpby);
+  const size_t batches = batch_offsets.empty() ? 1 : batch_offsets.size();
+  for (size_t batch = 0; batch < batches; ++batch) {
     compute_encoder.set_compute_pipeline_state(kernel);
 
-    // Set the arguments for the kernel
-    compute_encoder.set_input_array(C_split, 0);
-    compute_encoder.set_output_array(out, 1);
-    compute_encoder.set_bytes(split_k_partitions, 2);
-    compute_encoder.set_bytes(split_k_partition_stride, 3);
-    compute_encoder.set_bytes(N, 4);
+    int tn = (N + bn - 1) / bn;
+    int tm = (M + bm - 1) / bm;
 
-    if (do_axpby) {
-      int ldc = c.strides()[c.ndim() - 2];
-      int fdc = c.strides()[c.ndim() - 1];
+    GEMMSpiltKParams params{
+        /* const int M = */ M,
+        /* const int N = */ N,
+        /* const int K = */ K,
+        /* const int lda = */ lda,
+        /* const int ldb = */ ldb,
+        /* const int ldc = */ N,
+        /* const int tiles_n = */ tn,
+        /* const int tiles_m = */ tm,
+        /* const int split_k_partitions = */ split_k_partitions,
+        /* const int split_k_partition_stride = */ split_k_partition_stride,
+        /* const int split_k_partition_size = */ split_k_partition_size,
+        /* const int swizzle_log = */ 0, // no swizzle
+        /* const int gemm_k_iterations_aligned = */ gemm_k_iterations};
 
-      compute_encoder.set_input_array(c, 5);
-      compute_encoder.set_bytes(ldc, 6);
-      compute_encoder.set_bytes(fdc, 7);
-      compute_encoder.set_bytes(alpha, 8);
-      compute_encoder.set_bytes(beta, 9);
+    MTL::Size group_dims = MTL::Size(32, wn, wm);
+    MTL::Size grid_dims = MTL::Size(tn, tm, split_k_partitions);
+
+    const int64_t offset_a =
+        batch_offsets.empty() ? 0 : batch_offsets[batch].first * int64_t(a.itemsize());
+    const int64_t offset_b =
+        batch_offsets.empty() ? 0 : batch_offsets[batch].second * int64_t(b.itemsize());
+    compute_encoder.set_input_array(a, 0, offset_a);
+    compute_encoder.set_input_array(b, 1, offset_b);
+    compute_encoder.set_output_array(C_split, 2);
+
+    compute_encoder.set_bytes(params, 3);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+    // Do accum kernel
+    {
+      const bool do_axpby = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
+
+      auto kernel_name = "steel_gemm_splitk_accum_" + type_to_name(out) + "_" +
+          type_to_name(C_split);
+
+      if (do_axpby) {
+        kernel_name = kernel_name + "_axbpy";
+      }
+
+      auto kernel = get_steel_gemm_splitk_accum_kernel(
+          /* metal::Device& d = */ d,
+          /* const std::string& kernel_name = */ kernel_name,
+          /* const array& in = */ C_split,
+          /* const array& out = */ out,
+          /* bool axbpy = */ do_axpby);
+      compute_encoder.set_compute_pipeline_state(kernel);
+
+      // Set the arguments for the kernel
+      compute_encoder.set_input_array(C_split, 0);
+      compute_encoder.set_output_array(
+          out, 1, batch * size_t(M) * N * out.itemsize());
+      compute_encoder.set_bytes(split_k_partitions, 2);
+      compute_encoder.set_bytes(split_k_partition_stride, 3);
+      compute_encoder.set_bytes(N, 4);
+
+      if (do_axpby) {
+        int ldc = c.strides()[c.ndim() - 2];
+        int fdc = c.strides()[c.ndim() - 1];
+
+        compute_encoder.set_input_array(c, 5);
+        compute_encoder.set_bytes(ldc, 6);
+        compute_encoder.set_bytes(fdc, 7);
+        compute_encoder.set_bytes(alpha, 8);
+        compute_encoder.set_bytes(beta, 9);
+      }
+
+      // Launch enough thread groups for each output
+      MTL::Size grid_dims = MTL::Size(N, M, 1);
+      auto group_dims = get_block_dims(N, M, 1);
+      compute_encoder.dispatch_threads(grid_dims, group_dims);
     }
 
-    // Launch enough thread groups for each output
-    MTL::Size grid_dims = MTL::Size(N, M, 1);
-    auto group_dims = get_block_dims(N, M, 1);
-    compute_encoder.dispatch_threads(grid_dims, group_dims);
-  }
+  } // batch; the encoder barriers protect reuse of the FP32 partial buffer.
 
   compute_encoder.add_temporaries(std::move(copies));
 }
@@ -680,6 +713,33 @@ void steel_gemm_splitk_axpby_nax(
   int bm = 128, bn = 128, bk = 512;
   int wm = 4, wn = 4;
   int split_k_partition_size = 4096;
+
+  // Temp routing for larger devices
+  char devc = d.get_architecture().back();
+  if (devc == 'd') {
+    if (M <= 2048 && N <= 2048) {
+      bm = 64;
+      bn = 64;
+
+      wm = 2;
+      wn = 2;
+
+      split_k_partition_size = 2048;
+      bk = 256;
+    } else if (N > M) {
+      bm = 128;
+      bn = 64;
+
+      wm = 4;
+      wn = 2;
+    } else {
+      bm = 64;
+      bn = 128;
+
+      wm = 2;
+      wn = 4;
+    }
+  }
 
   if ((M + N) / 2 < 512 || K <= 4096) {
     bm = bn = 64;
@@ -754,6 +814,9 @@ void steel_gemm_splitk_axpby_nax(
   int tm = (M + bm - 1) / bm;
 
   int swizzle_log = tm <= 3 ? 0 : 1;
+  if (devc == 'd') {
+    swizzle_log = (M > N) ? 0 : 1;
+  }
 
   // Compute swizzled tile counts
   int tile = 1 << swizzle_log;
@@ -920,6 +983,37 @@ void steel_matmul_axpby(
   char devc = d.get_architecture().back();
   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
 
+  // Batched long reductions (not addmm): reuse one FP32 split-K scratch
+  // buffer across matrices. Broadcast GQA strides are resolved on the host.
+  // Limit the candidate to the affected M2 Max architecture. Other Macs,
+  // ordinary short matmuls and NAX routing keep their existing dispatch.
+  // Larger batches keep the parallel fused route: serial scratch reuse can
+  // regress throughput once there are enough independent matrices.
+  if constexpr (!CHECK_AB) {
+    if (d.get_architecture_gen() == 14 && devc == 's' && !use_nax &&
+        batch_size_out > 1 && batch_size_out <= 32 &&
+        K >= 65536 && (_tm * _tn) <= min_tmn_threshold &&
+        K >= std::max(M, N) &&
+        (a.dtype() == bfloat16 || a.dtype() == float16)) {
+      std::vector<std::pair<int64_t, int64_t>> offsets;
+      offsets.reserve(batch_size_out);
+      for (int batch = 0; batch < batch_size_out; ++batch) {
+        int64_t offset_a = 0, offset_b = 0;
+        int remaining = batch;
+        for (int axis = int(batch_shape.size()) - 1; axis >= 0; --axis) {
+          int index = remaining % batch_shape[axis];
+          remaining /= batch_shape[axis];
+          offset_a += index * A_batch_stride[axis];
+          offset_b += index * B_batch_stride[axis];
+        }
+        offsets.emplace_back(offset_a, offset_b);
+      }
+      return steel_gemm_splitk_axpby<false>(
+          s, d, a, b, c, out, M, N, K, batch_size_out, lda, ldb,
+          transpose_a, transpose_b, copies, alpha, beta, offsets);
+    }
+  }
+
   // Case 1: Small M×N with large K, use SIMD split-K
   // Max and Ultra dispatch larger sizes to splitk
   if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
@@ -944,7 +1038,61 @@ void steel_matmul_axpby(
         /* float beta = */ beta);
   }
 
-  // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
+  // Case 2: Few output columns, rows stay in registers and B is read once
+  if (use_nax && batch_size_out == 1 && !transpose_a && N <= 64 &&
+      out.dtype() != float32 && (transpose_b || int64_t(K) * ldb <= INT_MAX)) {
+    int sn = M < 2048 ? 1 : 2, ks = 4 / sn;
+    std::ostringstream kname;
+    kname << "steel_gemm_thin_nax_n" << (transpose_b ? 't' : 'n') << "_"
+          << type_to_name(out) << "_um2_un2_sm1_sn" << sn << "_ks" << ks;
+    auto base_name = kname.str();
+    bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+    bool do_axpby = use_out_source && (alpha != 1.0f || beta != 1.0f);
+    bool align_M = M % 32 == 0, align_N = N % (32 * sn) == 0;
+    bool align_K = K % 64 == 0;
+    kname << "_" << use_out_source << do_axpby << align_M << align_N << align_K;
+    auto kernel = get_steel_gemm_thin_nax_kernel(
+        d,
+        base_name,
+        kname.str(),
+        {{&use_out_source, MTL::DataType::DataTypeBool, 100},
+         {&do_axpby, MTL::DataType::DataTypeBool, 110},
+         {&align_M, MTL::DataType::DataTypeBool, 200},
+         {&align_N, MTL::DataType::DataTypeBool, 201},
+         {&align_K, MTL::DataType::DataTypeBool, 202}},
+        get_template_definition(
+            base_name,
+            "gemm_thin_nax",
+            get_type_string(out.dtype()),
+            2,
+            2,
+            1,
+            sn,
+            ks,
+            transpose_b));
+    auto& compute_encoder = metal::get_command_encoder(s);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    int tm = (M + 31) / 32, tn = (N + 32 * sn - 1) / (32 * sn);
+    int k_iters = ((K + 63) / 64 + ks - 1) / ks;
+    steel::GEMMParams params{
+        M, N, K, lda, ldb, N, tn, tm, 0, 0, 0, 0, k_iters, 0};
+    compute_encoder.set_input_array(a, 0);
+    compute_encoder.set_input_array(b, 1);
+    compute_encoder.set_output_array(out, 3);
+    compute_encoder.set_bytes(params, 4);
+    if (use_out_source) {
+      int ldc = c.strides()[c.ndim() - 2], fdc = c.strides()[c.ndim() - 1];
+      steel::GEMMAddMMParams addmm_params{ldc, fdc, 0, alpha, beta};
+      compute_encoder.set_input_array(c, 2);
+      compute_encoder.set_bytes(addmm_params, 5);
+    }
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size(tm * tn, 1, 1), MTL::Size(32 * sn * ks, 1, 1));
+    compute_encoder.add_temporaries(std::move(copies));
+    return;
+  }
+
+  // Case 3: Large K with sufficient M, N, and NAX is available, use NAX split-K
   if (use_nax && batch_size_out == 1 &&
       (K >= 3 * std::max(M, N) ||
        (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
@@ -2142,6 +2290,28 @@ void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 // GatherMM implementation
 ///////////////////////////////////////////////////////////////////////////////
 
+array gather_mm_offsets(
+    const array& indices,
+    int num_groups,
+    int M,
+    metal::Device& d,
+    const Stream& s) {
+  array offsets({num_groups}, int32, nullptr, {});
+  offsets.set_data(allocator::malloc(offsets.nbytes()));
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel("gather_mm_offsets");
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(indices, 0);
+  compute_encoder.set_output_array(offsets, 1);
+  compute_encoder.set_bytes(M, 2);
+  size_t group_size =
+      std::min<size_t>(num_groups, kernel->maxTotalThreadsPerThreadgroup());
+  compute_encoder.dispatch_threads(
+      MTL::Size(num_groups, 1, 1), MTL::Size(group_size, 1, 1));
+  compute_encoder.add_temporary(offsets);
+  return offsets;
+}
+
 void gather_mm_rhs(
     const array& a_,
     const array& b_,
@@ -2175,12 +2345,12 @@ void gather_mm_rhs(
   int M = a.size() / K;
   int N = b.shape(-1);
   int lda = K;
+  int num_groups = b.size() / (b.shape(-2) * b.shape(-1));
 
   // Define the dispatch blocks
   int bm = 16, bn = 64, bk = 16;
   int wm = 1, wn = 2;
 
-  const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
@@ -2207,7 +2377,6 @@ void gather_mm_rhs(
       wn);
 
   metal::MTLFCList func_consts = {
-      {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
   };
@@ -2218,12 +2387,12 @@ void gather_mm_rhs(
   concatenate(
       hash_name,
       base_name,
-      "_align_M_",
-      align_M ? 't' : 'n',
       "_align_N_",
       align_N ? 't' : 'n',
       "_align_K_",
       align_K ? 't' : 'n');
+
+  array offsets = gather_mm_offsets(indices, num_groups, M, d, s);
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -2245,6 +2414,7 @@ void gather_mm_rhs(
 
   // Prepare the matmul params
   auto batch_stride_b = b.ndim() > 2 ? b.strides()[b.ndim() - 3] : b.size();
+  int tiles_m = std::min(M, (M + bm - 1) / bm + num_groups - 1);
   steel::GEMMParams params{
       /* const int M = */ M,
       /* const int N = */ N,
@@ -2253,7 +2423,7 @@ void gather_mm_rhs(
       /* const int ldb = */ static_cast<int>(ldb),
       /* const int ldd = */ N,
       /* const int tiles_n = */ (N + bn - 1) / bn,
-      /* const int tiles_m = */ (M + bm - 1) / bm,
+      /* const int tiles_m = */ tiles_m,
       /* const int64_t batch_stride_a = */ 0,
       /* const int64_t batch_stride_b = */ static_cast<int64_t>(batch_stride_b),
       /* const int64_t batch_stride_d = */ 0,
@@ -2268,9 +2438,10 @@ void gather_mm_rhs(
   // Launch kernel
   compute_encoder.set_input_array(a, 0);
   compute_encoder.set_input_array(b, 1);
-  compute_encoder.set_input_array(indices, 2);
+  compute_encoder.set_input_array(offsets, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(params, 4);
+  compute_encoder.set_bytes(num_groups, 5);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
@@ -2308,14 +2479,14 @@ void gather_mm_rhs_nax(
   int M = a.size() / K;
   int N = b.shape(-1);
   int lda = K;
-  int E = b.shape(0);
+  int num_groups = b.size() / (b.shape(-2) * b.shape(-1));
 
   // Define the dispatch blocks
   int bm, bn = 128, bk = 128, wm, wn = 4;
-  if (M / E > 48) {
+  if (M / num_groups > 48) {
     bm = 64;
     wm = 2;
-  } else if (M / E > 24) {
+  } else if (M / num_groups > 24) {
     bm = 32l;
     wm = 1;
   } else {
@@ -2323,7 +2494,6 @@ void gather_mm_rhs_nax(
     wm = 1;
   }
 
-  const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
   const bool align_K = (K % bk) == 0;
 
@@ -2350,7 +2520,6 @@ void gather_mm_rhs_nax(
       wn);
 
   metal::MTLFCList func_consts = {
-      {&align_M, MTL::DataType::DataTypeBool, 200},
       {&align_N, MTL::DataType::DataTypeBool, 201},
       {&align_K, MTL::DataType::DataTypeBool, 202},
   };
@@ -2361,12 +2530,12 @@ void gather_mm_rhs_nax(
   concatenate(
       hash_name,
       base_name,
-      "_align_M_",
-      align_M ? 't' : 'n',
       "_align_N_",
       align_N ? 't' : 'n',
       "_align_K_",
       align_K ? 't' : 'n');
+
+  array offsets = gather_mm_offsets(indices, num_groups, M, d, s);
 
   // Get and set the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -2388,6 +2557,7 @@ void gather_mm_rhs_nax(
 
   // Prepare the matmul params
   auto batch_stride_b = b.ndim() > 2 ? b.strides()[b.ndim() - 3] : b.size();
+  int tiles_m = std::min(M, (M + bm - 1) / bm + num_groups - 1);
   steel::GEMMParams params{
       /* const int M = */ M,
       /* const int N = */ N,
@@ -2396,7 +2566,7 @@ void gather_mm_rhs_nax(
       /* const int ldb = */ static_cast<int>(ldb),
       /* const int ldd = */ N,
       /* const int tiles_n = */ (N + bn - 1) / bn,
-      /* const int tiles_m = */ (M + bm - 1) / bm,
+      /* const int tiles_m = */ tiles_m,
       /* const int64_t batch_stride_a = */ 0,
       /* const int64_t batch_stride_b = */ static_cast<int64_t>(batch_stride_b),
       /* const int64_t batch_stride_d = */ 0,
@@ -2411,9 +2581,10 @@ void gather_mm_rhs_nax(
   // Launch kernel
   compute_encoder.set_input_array(a, 0);
   compute_encoder.set_input_array(b, 1);
-  compute_encoder.set_input_array(indices, 2);
+  compute_encoder.set_input_array(offsets, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(params, 4);
+  compute_encoder.set_bytes(num_groups, 5);
 
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }

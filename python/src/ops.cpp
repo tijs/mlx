@@ -213,14 +213,14 @@ void init_ops(nb::module_& m) {
   m.def(
       "unstack",
       [](const mx::array& a, int axis, mx::StreamOrDevice s) {
-        return mx::unstack(a, axis, s);
+        return nb::tuple(nb::cast(mx::unstack(a, axis, s)));
       },
       nb::arg(),
       nb::kw_only(),
       "axis"_a = 0,
       "stream"_a = nb::none(),
       nb::sig(
-          "def unstack(x: array, /, *, axis: int = 0, stream: StreamOrDevice = None) -> list[array]"),
+          "def unstack(x: array, /, *, axis: int = 0, stream: StreamOrDevice = None) -> tuple[array, ...]"),
       R"pbdoc(
         Split an array into a sequence of arrays along the given axis.
 
@@ -232,7 +232,7 @@ void init_ops(nb::module_& m) {
             axis (int, optional): Axis along which to unstack. Default: ``0``.
 
         Returns:
-            list(array): A list of arrays, one for each index along ``axis``.
+            tuple(array): A tuple of arrays, one for each index along ``axis``.
       )pbdoc");
   m.def(
       "expand_dims",
@@ -1768,11 +1768,11 @@ void init_ops(nb::module_& m) {
       },
       nb::arg(),
       "indices"_a,
-      "axis"_a = nb::none(),
+      "axis"_a.none() = -1,
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def take_along_axis(a: array, /, indices: array, axis: int | None = None, *, stream: StreamOrDevice = None) -> array"),
+          "def take_along_axis(a: array, /, indices: array, axis: int | None = -1, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Take values along an axis at the specified indices.
 
@@ -1782,7 +1782,7 @@ void init_ops(nb::module_& m) {
               the input array excluding the `axis` dimension.
             axis (int or None): Axis in the input to take the values from. If
               ``axis == None`` the array is flattened to 1D prior to the indexing
-              operation.
+              operation. Defaults to ``-1``.
 
         Returns:
             array: The output array.
@@ -1807,7 +1807,7 @@ void init_ops(nb::module_& m) {
       nb::arg(),
       "indices"_a,
       "values"_a,
-      "axis"_a.none(),
+      "axis"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
@@ -2106,7 +2106,7 @@ void init_ops(nb::module_& m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def tri(n: int, m: int, k: int, dtype: Dtype | None = None, *, stream: StreamOrDevice = None) -> array"),
+          "def tri(n: int, m: int | None = None, k: int = 0, dtype: Dtype | None = None, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         An array with ones at and below the given diagonal and zeros elsewhere.
 
@@ -2128,7 +2128,7 @@ void init_ops(nb::module_& m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def tril(x: array, k: int, *, stream: StreamOrDevice = None) -> array"),
+          "def tril(x: array, k: int = 0, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Zeros the array above the given diagonal.
 
@@ -2148,7 +2148,7 @@ void init_ops(nb::module_& m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def triu(x: array, k: int, *, stream: StreamOrDevice = None) -> array"),
+          "def triu(x: array, k: int = 0, *, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Zeros the array below the given diagonal.
 
@@ -2550,6 +2550,16 @@ void init_ops(nb::module_& m) {
             array: The transposed array.
       )pbdoc");
   m.def(
+      "matrix_transpose",
+      &mx::matrix_transpose,
+      nb::arg(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def matrix_transpose(a: array, /, *, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+      Transpose the last two dimensions of the array.)pbdoc");
+  m.def(
       "permute_dims",
       [](const mx::array& a,
          const std::optional<std::vector<int>>& axes,
@@ -2856,7 +2866,9 @@ void init_ops(nb::module_& m) {
          const IntOrVec& axis,
          bool keepdims,
          int ddof,
+         std::optional<int> correction,
          mx::StreamOrDevice s) {
+        ddof = correction.value_or(ddof);
         return mx::var(a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
       },
       nb::arg(),
@@ -2864,6 +2876,7 @@ void init_ops(nb::module_& m) {
       "keepdims"_a = false,
       "ddof"_a = 0,
       nb::kw_only(),
+      "correction"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
           "def var(a: array, /, axis: None | int | Sequence[int] = None, keepdims: bool = False, ddof: int = 0, *, stream: StreamOrDevice = None) -> array"),
@@ -2889,7 +2902,9 @@ void init_ops(nb::module_& m) {
          const IntOrVec& axis,
          bool keepdims,
          int ddof,
+         std::optional<int> correction,
          mx::StreamOrDevice s) {
+        ddof = correction.value_or(ddof);
         return mx::std(a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
       },
       nb::arg(),
@@ -2897,6 +2912,7 @@ void init_ops(nb::module_& m) {
       "keepdims"_a = false,
       "ddof"_a = 0,
       nb::kw_only(),
+      "correction"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
           "def std(a: array, /, axis: None | int | Sequence[int] = None, keepdims: bool = False, ddof: int = 0, *, stream: StreamOrDevice = None) -> array"),
@@ -4711,14 +4727,14 @@ void init_ops(nb::module_& m) {
 
           .. table:: Quantization modes
 
-            ======  ======================   ==========================  =============  =====
-            mode    group size               bits                        scale type     bias
-            ======  ======================   ==========================  =============  =====
-            affine  32, 64\ :sup:`*`, 128    2, 3, 4\ :sup:`*`, 5, 6, 8  same as input  yes
-            mxfp4   32\ :sup:`*`             4\ :sup:`*`                 e8m0           no
-            mxfp8   32\ :sup:`*`             8\ :sup:`*`                 e8m0           no
-            nvfp4   16\ :sup:`*`             4\ :sup:`*`                 e4m3           no
-            ======  ======================   ==========================  =============  =====
+            ======  ======================   ==============================  =============  =====
+            mode    group size               bits                            scale type     bias
+            ======  ======================   ==============================  =============  =====
+            affine  32, 64\ :sup:`*`, 128    1, 2, 3, 4\ :sup:`*`, 5, 6, 8   same as input  yes
+            mxfp4   32\ :sup:`*`             4\ :sup:`*`                     e8m0           no
+            mxfp8   32\ :sup:`*`             8\ :sup:`*`                     e8m0           no
+            nvfp4   16\ :sup:`*`             4\ :sup:`*`                     e4m3           no
+            ======  ======================   ==============================  =============  =====
 
           :sup:`*` indicates the default value when unspecified.
 
@@ -4823,11 +4839,12 @@ void init_ops(nb::module_& m) {
       "group_size"_a = nb::none(),
       "bits"_a = nb::none(),
       "mode"_a = "affine",
+      "global_scale"_a = nb::none(),
       nb::kw_only(),
       "sorted_indices"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def gather_qmm(x: array, w: array, /, scales: array, biases: array | None = None, lhs_indices: array | None = None, rhs_indices: array | None = None, transpose: bool = True, group_size: int | None = None, bits: int | None = None, mode: str = 'affine', *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def gather_qmm(x: array, w: array, /, scales: array, biases: array | None = None, lhs_indices: array | None = None, rhs_indices: array | None = None, transpose: bool = True, group_size: int | None = None, bits: int | None = None, mode: str = 'affine', global_scale: array | None = None, *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Perform quantized matrix multiplication with matrix-level gather.
 
@@ -4857,6 +4874,9 @@ void init_ops(nb::module_& m) {
               ``w`` in the quantized array. See supported values and defaults in the
               :ref:`table of quantization modes <quantize-modes>`. Default: ``None``.
             mode (str, optional): The quantization mode. Default: ``"affine"``.
+            global_scale (array, optional): The per-input float32 scale used for
+              ``nvfp4`` quantization of ``w``. Only supported on the GPU.
+              Default: ``None``.
             sorted_indices (bool, optional): May allow a faster implementation
               if the passed indices are sorted. Default: ``False``.
 
@@ -5143,7 +5163,7 @@ void init_ops(nb::module_& m) {
       "sorted_indices"_a = false,
       "stream"_a = nb::none(),
       nb::sig(
-          "def gather_mm(a: array, b: array, /, lhs_indices: array, rhs_indices: array, *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
+          "def gather_mm(a: array, b: array, /, lhs_indices: array | None = None, rhs_indices: array | None = None, *, sorted_indices: bool = False, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Matrix multiplication with matrix-level gather.
 
@@ -6176,6 +6196,5 @@ void init_ops(nb::module_& m) {
   m.attr("cumulative_sum") = m.attr("cumsum");
   m.attr("empty") = m.attr("zeros");
   m.attr("empty_like") = m.attr("zeros_like");
-  m.attr("matrix_transpose") = m.attr("transpose");
   m.attr("pow") = m.attr("power");
 }

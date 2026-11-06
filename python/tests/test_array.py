@@ -140,6 +140,30 @@ class TestDtypes(mlx_tests.MLXTestCase):
                 self.assertListEqual(list(z.shape), list(x.shape))
                 self.assertListEqual(list(z.shape), list(y.shape))
 
+    def test_index_conversion(self):
+        for dtype in [
+            mx.uint8,
+            mx.uint16,
+            mx.uint32,
+            mx.uint64,
+            mx.int8,
+            mx.int16,
+            mx.int32,
+            mx.int64,
+        ]:
+            with self.subTest(dtype=dtype):
+                self.assertEqual(operator.index(mx.array(2, dtype)), 2)
+                self.assertEqual(list(range(mx.array(3, dtype))), [0, 1, 2])
+
+    def test_index_conversion_invalid(self):
+        for dtype in [mx.float16, mx.float32, mx.bfloat16, mx.complex64, mx.bool_]:
+            with self.subTest(dtype=dtype):
+                with self.assertRaises(TypeError):
+                    operator.index(mx.array(2, dtype))
+
+                with self.assertRaises(TypeError):
+                    list(range(mx.array(3, dtype)))
+
     def test_finfo(self):
         with self.assertRaises(ValueError):
             mx.finfo(mx.int32)
@@ -467,6 +491,27 @@ class TestArray(mlx_tests.MLXTestCase):
         x = mx.array((1, 2, 3), mx.int32)
         self.assertEqual(x.dtype, mx.int32)
         self.assertEqual(x.tolist(), [1, 2, 3])
+
+    def test_matrix_transpose(self):
+        x = mx.array([[1, 2], [3, 4]])
+        self.assertEqual(x.mT.tolist(), [[1, 3], [2, 4]])
+        self.assertEqual(mx.matrix_transpose(x).tolist(), [[1, 3], [2, 4]])
+
+        x = mx.arange(24).reshape((2, 3, 4))
+        self.assertEqual(x.mT.shape, (2, 4, 3))
+        self.assertEqualArray(x.mT, x.transpose((0, 2, 1)))
+        self.assertEqualArray(x.mT.mT, x)
+
+        self.assertEqual(mx.matrix_transpose(x).shape, (2, 4, 3))
+        self.assertEqualArray(mx.matrix_transpose(x), x.transpose((0, 2, 1)))
+
+        x = mx.array([1, 2, 3])
+
+        with self.assertRaises(ValueError):
+            x.mT
+
+        with self.assertRaises(ValueError):
+            mx.matrix_transpose(x)
 
     def test_bool_conversion(self):
         x = mx.array(True)
@@ -1044,6 +1089,10 @@ class TestArray(mlx_tests.MLXTestCase):
         self.assertEqual(y.tolist(), [3.0, 4.0])
         self.assertEqual(z.tolist(), [5.0, 6.0])
 
+        a = mx.array(3)
+        with self.assertRaises(TypeError):
+            list(a)
+
     def test_array_pickle(self):
         dtypes = [
             mx.int8,
@@ -1267,6 +1316,13 @@ class TestArray(mlx_tests.MLXTestCase):
         a_mlx = mx.array(a_np)
         self.assertTrue(np.array_equal(a_np[2:-1, 0], np.array(a_mlx[2:-1, 0])))
 
+        # Ellipsis with more trailing indices than dimensions
+        a_mlx = mx.array([1, 2, 3])
+        with self.assertRaises(ValueError):
+            a_mlx[..., 0, 0]
+        with self.assertRaises(ValueError):
+            a_mlx[..., 0, 0] = 5
+
     def test_indexing_grad(self):
         x = mx.array([[1, 2], [3, 4]]).astype(mx.float32)
         ind = mx.array([0, 1, 0]).astype(mx.float32)
@@ -1340,6 +1396,13 @@ class TestArray(mlx_tests.MLXTestCase):
 
         a[0:1] = mx.array([1])
         self.assertEqual(a.tolist(), [1, 4, 4])
+
+        # Regression test: a negative integer index after a None
+        # (newaxis) used to be normalized against the wrong axis size,
+        # silently writing nothing instead of updating the last row.
+        b = mx.zeros((3, 4))
+        b[None, -1] = 9
+        self.assertEqual(b.tolist(), [[0, 0, 0, 0], [0, 0, 0, 0], [9, 9, 9, 9]])
 
         with self.assertRaises(ValueError):
             a[0:1] = mx.array([2, 3])
@@ -2003,6 +2066,15 @@ class TestArray(mlx_tests.MLXTestCase):
         else:
             self.assertEqual(b"aaaaaaaaaa", ab[::2])
             self.assertEqual(b"abcdefghij", ab[1::2])
+
+        # Test bytes on non-contiguous arrays
+        a = mx.arange(10, dtype=mx.uint8)
+        self.assertEqual(bytes(a[::2]), b"\x00\x02\x04\x06\x08")
+        self.assertEqual(bytes(a[::-1]), b"\x09\x08\x07\x06\x05\x04\x03\x02\x01\x00")
+        b = mx.arange(6, dtype=mx.int32).reshape(2, 3).T
+        self.assertEqual(bytes(b), np.array(b).tobytes())
+        c = mx.broadcast_to(mx.array([1, 2], dtype=mx.uint8), (3, 2))
+        self.assertEqual(bytes(c), np.array(c).tobytes())
 
     def test_buffer_protocol_ref_counting(self):
         a = mx.arange(3)

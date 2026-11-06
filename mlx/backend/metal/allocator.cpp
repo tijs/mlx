@@ -64,9 +64,12 @@ MetalAllocator::MetalAllocator(Device& d)
   auto max_rec_size =
       std::get<size_t>(info.at("max_recommended_working_set_size"));
   resource_limit_ = std::get<size_t>(info.at("resource_limit"));
-  block_limit_ = std::min(1.5 * max_rec_size, 0.95 * memsize);
-  gc_limit_ = std::min(static_cast<size_t>(0.95 * max_rec_size), block_limit_);
-  max_pool_size_ = block_limit_;
+  block_limit_.store(
+      std::min(1.5 * max_rec_size, 0.95 * memsize), std::memory_order_relaxed);
+  gc_limit_ = std::min(
+      static_cast<size_t>(0.95 * max_rec_size),
+      block_limit_.load(std::memory_order_relaxed));
+  max_pool_size_ = block_limit_.load(std::memory_order_relaxed);
   bool is_vm = std::get<std::string>(info.at("device_name")) ==
       "Apple Paravirtual device";
   if (is_vm) {
@@ -90,15 +93,15 @@ size_t MetalAllocator::set_cache_limit(size_t limit) {
 
 size_t MetalAllocator::set_memory_limit(size_t limit) {
   std::unique_lock lk(mutex_);
-  std::swap(limit, block_limit_);
+  limit = block_limit_.exchange(limit, std::memory_order_relaxed);
   gc_limit_ = std::min(
-      block_limit_,
+      block_limit_.load(std::memory_order_relaxed),
       static_cast<size_t>(0.95 * device_->recommendedMaxWorkingSetSize()));
   return limit;
 };
 
 size_t MetalAllocator::get_memory_limit() {
-  return block_limit_;
+  return block_limit_.load(std::memory_order_relaxed);
 }
 
 size_t MetalAllocator::set_wired_limit(size_t limit) {
@@ -210,7 +213,8 @@ Buffer MetalAllocator::malloc(size_t size) {
   std::unique_lock lk(mutex_);
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
   if (!buf) {
-    size_t mem_required = get_active_memory() + get_cache_memory() + size;
+    size_t mem_required =
+        get_active_memory() + buffer_cache_.cache_size() + size;
 
     // If we have a lot of memory pressure try to reclaim memory from the cache
     if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
@@ -244,13 +248,19 @@ Buffer MetalAllocator::malloc(size_t size) {
     }
   }
 
-  active_memory_ += buf->length();
-  peak_memory_ = std::max(peak_memory_, active_memory_);
+  active_memory_.store(
+      active_memory_.load(std::memory_order_relaxed) + buf->length(),
+      std::memory_order_relaxed);
+  peak_memory_.store(
+      std::max(
+          peak_memory_.load(std::memory_order_relaxed),
+          active_memory_.load(std::memory_order_relaxed)),
+      std::memory_order_relaxed);
 
   // Maintain the cache below the requested limit
-  if (get_cache_memory() > max_pool_size_) {
+  if (buffer_cache_.cache_size() > max_pool_size_) {
     num_resources_ -= buffer_cache_.release_cached_buffers(
-        get_cache_memory() - max_pool_size_);
+        buffer_cache_.cache_size() - max_pool_size_);
   }
 
   return Buffer{static_cast<void*>(buf)};
@@ -267,13 +277,15 @@ void MetalAllocator::free(Buffer buffer) {
     return;
   }
   std::unique_lock lk(mutex_);
-  active_memory_ -= buf->length();
+  active_memory_.store(
+      active_memory_.load(std::memory_order_relaxed) - buf->length(),
+      std::memory_order_relaxed);
   if (buf->length() <= max_pool_size_) {
     // Keep recent shapes instead of filling the pool with stale buffers.
     const size_t available = max_pool_size_ - buf->length();
-    if (get_cache_memory() > available) {
+    if (buffer_cache_.cache_size() > available) {
       num_resources_ -= buffer_cache_.release_cached_buffers(
-          get_cache_memory() - available);
+          buffer_cache_.cache_size() - available);
     }
     buffer_cache_.recycle_to_cache(buf);
   } else {
@@ -298,8 +310,14 @@ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
   }
   std::unique_lock lk(mutex_);
   residency_sets_.insert(buf);
-  active_memory_ += buf->length();
-  peak_memory_ = std::max(peak_memory_, active_memory_);
+  active_memory_.store(
+      active_memory_.load(std::memory_order_relaxed) + buf->length(),
+      std::memory_order_relaxed);
+  peak_memory_.store(
+      std::max(
+          peak_memory_.load(std::memory_order_relaxed),
+          active_memory_.load(std::memory_order_relaxed)),
+      std::memory_order_relaxed);
   num_resources_++;
   return Buffer{static_cast<void*>(buf)};
 }
@@ -310,7 +328,9 @@ void MetalAllocator::release(Buffer buffer) {
     return;
   }
   std::unique_lock lk(mutex_);
-  active_memory_ -= buf->length();
+  active_memory_.store(
+      active_memory_.load(std::memory_order_relaxed) - buf->length(),
+      std::memory_order_relaxed);
   num_resources_--;
   residency_sets_.erase(buf);
   lk.unlock();

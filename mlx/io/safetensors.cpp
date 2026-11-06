@@ -144,11 +144,6 @@ bool env_truthy(const char* key) {
   return value == "1" || value == "true" || value == "on" || value == "yes";
 }
 
-bool mmap_safetensors_enabled() {
-  return env_truthy("MLX_SAFETENSORS_MMAP") ||
-      env_truthy("VMLINUX_MMAP_SAFETENSORS");
-}
-
 bool mmap_debug_enabled() {
   return env_truthy("MLX_SAFETENSORS_MMAP_DEBUG") ||
       env_truthy("VMLINUX_MMAP_SAFETENSORS_DEBUG");
@@ -989,12 +984,13 @@ int64_t safetensors_mmap_tracked_buffer_bytes() {
 #endif
 }
 
-array mmap_file_region(
+static array mmap_file_region_impl(
     const std::string& file,
     uint64_t offset,
     size_t length,
     Shape shape,
-    Dtype dtype) {
+    Dtype dtype,
+    std::optional<int32_t> registered_layer) {
 #ifndef _WIN32
   if (length == 0) {
     throw std::runtime_error("[mmap_file_region] length must be non-zero.");
@@ -1080,10 +1076,113 @@ array mmap_file_region(
       tensor.flags(),
       tensor.size(),
       static_cast<int64_t>(offset_delta / item_size));
+  if (registered_layer) {
+    auto& registry = SafetensorsMmapRegistry::instance();
+    registry.register_layer_region(
+        shard, *registered_layer, static_cast<size_t>(offset_delta), length);
+    const auto experts = static_cast<size_t>(shape[0]);
+    const auto per_expert = length / experts;
+    for (size_t expert = 0; expert < experts; ++expert) {
+      registry.register_region(
+          shard,
+          *registered_layer,
+          static_cast<int32_t>(expert),
+          static_cast<size_t>(offset_delta) + expert * per_expert,
+          per_expert);
+    }
+  }
   return tensor;
 #else
   throw std::runtime_error("[mmap_file_region] unsupported on Windows.");
 #endif
+}
+
+array mmap_file_region(
+    const std::string& file,
+    uint64_t offset,
+    size_t length,
+    Shape shape,
+    Dtype dtype) {
+  return mmap_file_region_impl(
+      file, offset, length, std::move(shape), dtype, std::nullopt);
+}
+
+array mmap_file_region_named(
+    const std::string& file,
+    uint64_t offset,
+    size_t length,
+    Shape shape,
+    Dtype dtype,
+    const std::string& tensor_name) {
+  // Admit routed banks and one-expert dense down banks. The old loader's
+  // name matching and unnamed API are unchanged.
+  // Routed banks may sit under a VLM `language_model.` wrapper (MiniCPM-V 4.7
+  // 35B-A3B JANGH2, 2026-10-12). The layer index stays capture group 1.
+  static const std::regex canonical(
+      R"(^(?:language_model\.)?model\.layers\.(0|[1-9][0-9]*)\.(?:mlp|feed_forward)\.switch_mlp\.(gate|up|down)_proj\.tq2_(packed|scales)$)");
+  // Dense one-expert banks: K2 down projections
+  // (`model.layers.L.mlp.down_proj`) and the Qwen3.5-family dense JANGH MLP
+  // (`language_model.model.layers.L.mlp.{gate,up,down}_proj`, Qwen3.8-27B
+  // JANGH2, 2026-10-06). The layer index stays capture group 1 for the
+  // JangPress layer registry.
+  static const std::regex dense_canonical(
+      R"(^(?:language_model\.)?model\.layers\.(0|[1-9][0-9]*)\.mlp\.(gate|up|down)_proj\.tq2_(packed|scales)$)");
+  // Nemotron-H latent MoE (Nemotron 3.5 Bolt JANGH2): gate-less relu2 routed
+  // banks at `backbone.layers.L.mixer.switch_mlp.{fc1,fc2}`. The layer index
+  // stays capture group 1 and the packed/scales tag group 3.
+  static const std::regex relu2_canonical(
+      R"(^backbone\.layers\.(0|[1-9][0-9]*)\.mixer\.switch_mlp\.(fc1|fc2)\.tq2_(packed|scales)$)");
+  std::smatch match;
+  bool dense = false;
+  if (!std::regex_match(tensor_name, match, canonical) &&
+      !std::regex_match(tensor_name, match, relu2_canonical)) {
+    if (!std::regex_match(tensor_name, match, dense_canonical)) {
+      throw std::invalid_argument(
+          "[mmap_file_region_named] invalid canonical bank name.");
+    }
+    dense = true;
+  }
+  const auto layer_value = std::stoull(match[1].str());
+  if (layer_value >
+      static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    throw std::invalid_argument(
+        "[mmap_file_region_named] layer index overflow.");
+  }
+  const bool packed = match[3].str() == "packed";
+  if (shape.size() != (packed ? 3 : 2) ||
+      dtype != (packed ? uint32 : float16) || (dense && shape[0] != 1)) {
+    throw std::invalid_argument(
+        "[mmap_file_region_named] bank rank/dtype mismatch.");
+  }
+  size_t expected = size_of(dtype);
+  for (auto dim : shape) {
+    if (dim <= 0 ||
+        expected >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      throw std::invalid_argument(
+          "[mmap_file_region_named] invalid bank dimensions.");
+    }
+    expected *= static_cast<size_t>(dim);
+  }
+  if (expected != length || length % static_cast<size_t>(shape[0]) != 0) {
+    throw std::invalid_argument(
+        "[mmap_file_region_named] bank byte count mismatch.");
+  }
+#ifndef _WIN32
+  const auto delta = offset % static_cast<uint64_t>(getpagesize());
+  if (length >
+      static_cast<uint64_t>(std::numeric_limits<ShapeElem>::max()) - delta) {
+    throw std::invalid_argument(
+        "[mmap_file_region_named] bank mapped span overflow.");
+  }
+#endif
+  return mmap_file_region_impl(
+      file,
+      offset,
+      length,
+      std::move(shape),
+      dtype,
+      static_cast<int32_t>(layer_value));
 }
 
 /** Load array from reader in safetensor format */
@@ -1203,20 +1302,6 @@ SafetensorsLoad load_safetensors(
 }
 
 SafetensorsLoad load_safetensors(const std::string& file, StreamOrDevice s) {
-#ifndef _WIN32
-  if (mmap_safetensors_enabled()) {
-    if (auto loaded = load_safetensors_mmap(file, s)) {
-      return *std::move(loaded);
-    }
-    if (mmap_debug_enabled()) {
-      std::fprintf(
-          stderr,
-          "[mlx.safetensors.mmap] fallback-to-reader file=%s\n",
-          file.c_str());
-      std::fflush(stderr);
-    }
-  }
-#endif
   return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
 }
 
@@ -1224,20 +1309,6 @@ SafetensorsLoad load_safetensors_excluding(
     const std::string& file,
     const std::unordered_set<std::string>& excluded_keys,
     StreamOrDevice s) {
-#ifndef _WIN32
-  if (mmap_safetensors_enabled()) {
-    if (auto loaded = load_safetensors_mmap(file, s, &excluded_keys)) {
-      return *std::move(loaded);
-    }
-    if (mmap_debug_enabled()) {
-      std::fprintf(
-          stderr,
-          "[mlx.safetensors.mmap] filtered-fallback-to-reader file=%s\n",
-          file.c_str());
-      std::fflush(stderr);
-    }
-  }
-#endif
   return load_safetensors(
       std::make_shared<io::ParallelFileReader>(file), s, &excluded_keys);
 }
@@ -1245,23 +1316,8 @@ SafetensorsLoad load_safetensors_excluding(
 SafetensorsLoad load_safetensors_excluding(
     const std::string& file,
     const std::unordered_set<std::string>& excluded_keys,
-    bool exact_tensor_buffers,
+    bool /* exact_tensor_buffers */,
     StreamOrDevice s) {
-#ifndef _WIN32
-  if (mmap_safetensors_enabled()) {
-    if (auto loaded = load_safetensors_mmap(
-            file, s, &excluded_keys, exact_tensor_buffers)) {
-      return *std::move(loaded);
-    }
-    if (mmap_debug_enabled()) {
-      std::fprintf(
-          stderr,
-          "[mlx.safetensors.mmap] exact-filtered-fallback-to-reader file=%s\n",
-          file.c_str());
-      std::fflush(stderr);
-    }
-  }
-#endif
   return load_safetensors(
       std::make_shared<io::ParallelFileReader>(file), s, &excluded_keys);
 }
@@ -1270,6 +1326,20 @@ void save_safetensors(
     std::shared_ptr<io::Writer> out_stream,
     std::unordered_map<std::string, array> a,
     std::unordered_map<std::string, std::string> metadata /* = {} */) {
+  {
+    std::vector<array> to_eval;
+    to_eval.reserve(a.size());
+    for (auto& p : a) {
+      p.second = contiguous(p.second);
+      to_eval.push_back(p.second);
+    }
+    eval(std::move(to_eval));
+  }
+
+  // Open only after the inputs are evaluated: opening a FileWriter
+  // truncates the file and lazy inputs may still read from it.
+  out_stream->open();
+
   ////////////////////////////////////////////////////////
   // Check file
   if (!out_stream->good() || !out_stream->is_open()) {
@@ -1286,16 +1356,6 @@ void save_safetensors(
     _metadata[key] = value;
   }
   parent["__metadata__"] = _metadata;
-
-  {
-    std::vector<array> to_eval;
-    to_eval.reserve(a.size());
-    for (auto& p : a) {
-      p.second = contiguous(p.second);
-      to_eval.push_back(p.second);
-    }
-    eval(std::move(to_eval));
-  }
 
   size_t offset = 0;
   for (auto& [key, arr] : a) {

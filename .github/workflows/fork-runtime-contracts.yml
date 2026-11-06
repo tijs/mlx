@@ -1,0 +1,56 @@
+name: Fork Runtime Contracts
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  cpu-runtime-contracts:
+    if: github.repository == 'osaurus-ai/mlx'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CPU linear algebra headers
+        run: sudo apt-get update && sudo apt-get install -y liblapacke-dev libopenblas-dev
+      - name: Build native CPU tests
+        run: |
+          cmake -S . -B build-contracts -DCMAKE_BUILD_TYPE=Release -DMLX_BUILD_METAL=OFF -DMLX_BUILD_CUDA=OFF -DMLX_BUILD_TESTS=ON -DMLX_BUILD_EXAMPLES=OFF
+          cmake --build build-contracts --target tests --parallel 2
+      - name: Exercise fork contracts and upstream ownership changes
+        run: |
+          python3 - <<'PYTEST'
+          import subprocess, xml.etree.ElementTree as E
+          expected = [
+              "test array buffer size",
+              "test concurrent allocator statistics",
+              "test concurrent allocator limit and peak observations",
+              "test concurrent scheduler active task observations",
+              "test siblings circular references without eval",
+              "test siblings circular references released by assignment",
+              "test siblings circular references released by overwrite",
+              "test assigning a sibling over the last reference keeps the cycle",
+              "named mmap banks register expert ranges and release weak owners",
+              "dense named mmap keeps one-expert ownership and layer advice",
+              "named mmap rejects invalid contract before registering",
+              "unnamed mmap regions retain their unregistered behavior",
+              "test safetensors file boundary validation",
+              "test eval does not create default stream",
+              "test compile does not create default stream",
+          ]
+          subprocess.run(["build-contracts/tests/tests", "--test-case=" + ",".join(expected), "--reporters=xml", "--out=runtime-contracts.xml"], check=True)
+          root = E.parse("runtime-contracts.xml").getroot()
+          cases = [c for c in root.findall(".//TestCase") if c.get("skipped") != "true"]
+          assert sorted(c.get("name") for c in cases) == sorted(expected)
+          for case in cases:
+              result = case.find("OverallResultsAsserts")
+              assert result is not None and result.get("failures") == "0"
+              assert not case.findall(".//Exception")
+          print("PASS", len(cases), "CPU runtime contracts; Metal coverage requires local native proof")
+          PYTEST
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-runtime-contracts
+          path: runtime-contracts.xml

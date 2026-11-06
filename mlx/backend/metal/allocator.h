@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -24,16 +25,17 @@ class MetalAllocator : public allocator::Allocator {
   virtual void release(Buffer buffer) override;
 
   size_t get_active_memory() {
-    return active_memory_;
+    return active_memory_.load(std::memory_order_relaxed);
   };
   size_t get_peak_memory() {
-    return peak_memory_;
+    return peak_memory_.load(std::memory_order_relaxed);
   };
   void reset_peak_memory() {
     std::unique_lock lk(mutex_);
-    peak_memory_ = 0;
+    peak_memory_.store(0, std::memory_order_relaxed);
   };
   size_t get_cache_memory() {
+    std::unique_lock lk(mutex_);
     return buffer_cache_.cache_size();
   };
   size_t set_cache_limit(size_t limit);
@@ -63,10 +65,12 @@ class MetalAllocator : public allocator::Allocator {
   BufferCache<MTL::Buffer> buffer_cache_;
 
   // Allocation stats
-  size_t block_limit_;
+  // Independent snapshots; writes and cache bookkeeping retain mutex_
+  // ownership.
+  std::atomic<size_t> block_limit_;
   size_t gc_limit_;
-  size_t active_memory_{0};
-  size_t peak_memory_{0};
+  std::atomic<size_t> active_memory_{0};
+  std::atomic<size_t> peak_memory_{0};
   size_t max_pool_size_;
   size_t wired_limit_{0};
   size_t num_resources_{0};

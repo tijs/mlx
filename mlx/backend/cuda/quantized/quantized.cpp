@@ -1,4 +1,4 @@
-// Copyright © 2025 Apple Inc.
+// Copyright © 2025-2026 Apple Inc.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
@@ -159,9 +159,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
+  // Affine gets biases at index 3, nvfp4 an optional global scale.
   std::optional<array> biases;
-  if (inputs.size() == 6) {
+  std::optional<array> global_scale;
+  if (mode_ == QuantizationMode::Affine) {
     biases = inputs[3];
+  } else if (inputs.size() == 6) {
+    global_scale = ensure_row_contiguous(inputs[3], encoder, s);
   }
   array lhs_indices =
       ensure_row_contiguous(inputs[inputs.size() - 2], encoder, s);
@@ -186,7 +190,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder.device());
   };
-  bool can_use_qmm_sm80 = supports(supports_qmm_sm80);
+  // qmm_sm80 does not apply global scales yet; route such calls to the
+  // naive kernel until it does.
+  bool can_use_qmm_sm80 =
+      !global_scale.has_value() && supports(supports_qmm_sm80);
   bool can_use_qmm_naive = supports(supports_qmm_naive);
   bool can_use_qmv = supports(supports_qmv);
 
@@ -212,7 +219,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         w,
         scales,
         biases,
-        std::nullopt,
+        global_scale,
         lhs_indices,
         rhs_indices,
         out,
@@ -229,6 +236,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         w,
         scales,
         biases,
+        global_scale,
         lhs_indices,
         rhs_indices,
         out,

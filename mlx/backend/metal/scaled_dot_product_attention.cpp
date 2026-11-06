@@ -1,4 +1,4 @@
-// Copyright © 2024 Apple Inc.
+// Copyright © 2024-26 Apple Inc.
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -29,13 +29,13 @@ void sdpa_full_self_attention_nax(
   using namespace mlx::steel;
 
   int bd = q.shape(-1);
-  int bq = 64;
+  int bv = v.shape(-1);
+  int bq = bd == 512 ? 32 : 64;
   int bk = 32;
 
-  bool split_d = bd == 256;
-  int wm = 4;
-  int wn = split_d ? 2 : 1;
-
+  bool split_d = bd == 256 || bd == 512;
+  int wm = bd == 512 ? 2 : 4;
+  int wn = split_d ? bd / 128 : 1;
   int B = q.shape(0);
   int H = q.shape(1);
   int D = q.shape(3);
@@ -98,6 +98,8 @@ void sdpa_full_self_attention_nax(
       bk,
       "_bd",
       bd,
+      "_bv",
+      bv,
       "_wm",
       wm,
       "_wn",
@@ -131,6 +133,7 @@ void sdpa_full_self_attention_nax(
       bq,
       bk,
       bd,
+      bv,
       wm,
       wn,
       (has_mask ? *mask : q),
@@ -216,7 +219,7 @@ void sdpa_full_self_attention_metal(
   int kL = k.shape(2);
 
   if (metal::is_nax_available() &&
-      (D == 64 || D == 96 || D == 128 || D == 256) &&
+      (D == 64 || D == 96 || D == 128 || D == 256 || D == 512) &&
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -231,14 +234,88 @@ void sdpa_full_self_attention_metal(
         /* const std::optional<array>& sinks = */ sinks);
   }
 
+  // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
+  // are zero and the caller's scale is retained. Enable by default only for
+  // long, unmasked half-precision attention, where the attention work can
+  // amortize the padding and output copy. The override is read per call.
+  bool pad_default = qL >= 512 && kL >= 512 && !do_causal_ && !mask && !sinks;
+  if ((D == 72 || D == 80) && metal::is_nax_available() &&
+      (q.dtype() == float16 || q.dtype() == bfloat16) &&
+      env::get_var("MLX_SDPA_PAD_HEAD_DIM", pad_default ? 1 : 0) == 1) {
+    constexpr int pad_to = 96;
+    auto& enc = metal::get_command_encoder(s);
+    array zero = array(0, q.dtype());
+
+    auto pad_head_dim = [&](const array& x) {
+      Shape padded_shape = x.shape();
+      padded_shape.back() = pad_to;
+      array xp(std::move(padded_shape), x.dtype(), nullptr, {});
+      fill_gpu(zero, xp, s);
+      // Explicit output strides: a [.., D] view over xp would be
+      // non-contiguous with span > size, so it cannot carry xp's flags.
+      copy_gpu_inplace(
+          /* const array& in = */ x,
+          /* array& out = */ xp,
+          /* const Shape& data_shape = */ x.shape(),
+          /* const Strides& i_strides = */ x.strides(),
+          /* const Strides& o_strides = */ xp.strides(),
+          /* int64_t i_offset = */ 0,
+          /* int64_t o_offset = */ 0,
+          /* CopyType ctype = */ CopyType::GeneralGeneral,
+          /* const Stream& s = */ s);
+      enc.add_temporary(xp);
+      return xp;
+    };
+
+    array qp = pad_head_dim(q);
+    array kp = pad_head_dim(k);
+    array vp = pad_head_dim(v);
+
+    Shape padded_out = o.shape();
+    padded_out.back() = pad_to;
+    array op(std::move(padded_out), o.dtype(), nullptr, {});
+    op.set_data(allocator::malloc(op.nbytes()));
+
+    sdpa_full_self_attention_nax(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& q = */ qp,
+        /* const array& k = */ kp,
+        /* const array& v = */ vp,
+        /* const float scale = */ scale,
+        /* array& o = */ op,
+        /* bool do_causal_ = */ do_causal_,
+        /* const std::optional<array>& mask = */ mask,
+        /* const std::optional<array>& sinks = */ sinks);
+
+    // Slice the padded lanes back out into o's caller-chosen strides.
+    copy_gpu_inplace(
+        /* const array& in = */ op,
+        /* array& out = */ o,
+        /* const Shape& data_shape = */ o.shape(),
+        /* const Strides& i_strides = */ op.strides(),
+        /* const Strides& o_strides = */ o.strides(),
+        /* int64_t i_offset = */ 0,
+        /* int64_t o_offset = */ 0,
+        /* CopyType ctype = */ CopyType::GeneralGeneral,
+        /* const Stream& s = */ s);
+    enc.add_temporary(op);
+    enc.add_temporary(zero);
+    return;
+  }
+
   using namespace mlx::steel;
 
-  int wm = 4;
-  int wn = 1;
-
+  char devc = d.get_architecture().back();
   int bd = q.shape(-1);
+  int bv = v.shape(-1);
   int bq = 32;
-  int bk = bd < 128 ? 32 : 16;
+  int bk = (bd == 256) && (q.dtype() != float32) && (devc == 'd')
+      ? 32
+      : (bd < 128 ? 32 : 16);
+
+  int wm = 4;
+  int wn = (bd == 256) ? 2 : 1;
 
   const bool align_Q = (qL % bq) == 0;
   const bool align_K = (kL % bk) == 0;
@@ -264,6 +341,8 @@ void sdpa_full_self_attention_metal(
       bk,
       "_bd",
       bd,
+      "_bv",
+      bv,
       "_wm",
       wm,
       "_wn",
@@ -297,6 +376,7 @@ void sdpa_full_self_attention_metal(
       bq,
       bk,
       bd,
+      bv,
       wm,
       wn,
       (has_mask ? *mask : q));
@@ -466,10 +546,15 @@ void sdpa_vector_2pass(
   std::string kname;
   kname.reserve(64);
   kname += "sdpa_vector_2pass_1";
-  if (!mask && !sinks && q.shape(2) == 1 && q.shape(1) == 8 * k.shape(1) &&
-      q.shape(-1) == v.shape(-1) && (q.shape(-1) == 64 || q.shape(-1) == 128) &&
-      k.shape(2) >= 8192) {
-    kname += "_gqa";
+  int gqa_factor = q.shape(1) / k.shape(1);
+  bool gqa_dims =
+      (gqa_factor == 8 && (q.shape(-1) == 64 || q.shape(-1) == 128)) ||
+      ((gqa_factor == 12 || gqa_factor == 16) && q.shape(-1) == 128);
+  if (!mask && !sinks && q.shape(2) == 1 &&
+      q.shape(1) == gqa_factor * k.shape(1) && q.shape(-1) == v.shape(-1) &&
+      gqa_dims && k.shape(2) >= 8192) {
+    kname += "_gqa_";
+    kname += std::to_string(gqa_factor);
   }
   kname += "_";
   kname += get_type_string(q.dtype());
@@ -479,7 +564,6 @@ void sdpa_vector_2pass(
   kname += std::to_string(v.shape(-1));
 
   // Compute the necessary sizes
-  int gqa_factor = q.shape(1) / k.shape(1);
   int n_simds = gqa_factor * q.shape(2);
 
   char devc = d.get_architecture().back();
@@ -570,6 +654,18 @@ void sdpa_vector_2pass(
 
   // Get the kernel
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  // M1/M2 do not have enough threads per threadgroup for default TK=4 kernel
+  bool has_tk1_variant =
+      (q.dtype() == bfloat16 && q.shape(-1) == 256 && v.shape(-1) == 256) ||
+      (q.dtype() == float32 && q.shape(-1) == v.shape(-1) &&
+       (q.shape(-1) == 192 || q.shape(-1) == 256));
+  if (has_tk1_variant &&
+      group_dims.width * group_dims.height * group_dims.depth >
+          kernel->maxTotalThreadsPerThreadgroup()) {
+    kname += "_tk1";
+    hash_name += "_tk1";
+    kernel = d.get_kernel(kname, hash_name, func_consts);
+  }
   check_kernel_threadgroup_size(kernel, group_dims, hash_name);
 
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -659,15 +755,22 @@ std::tuple<bool, std::string> has_fused_kernel(
 
   std::ostringstream msg;
   if (query_sequence_length > 8) {
-    const bool supported_head_dim = query_head_dim == value_head_dim &&
-        (query_head_dim == 64 || query_head_dim == 72 || query_head_dim == 80 ||
-         query_head_dim == 96 || query_head_dim == 128 ||
-         query_head_dim == 192 || query_head_dim == 256);
+    const bool supports_d512 = metal::is_nax_available() &&
+        (env::enable_tf32() || q.dtype() != float32);
+    const bool asymmetric = query_head_dim == 96 && value_head_dim == 64;
+    const bool supported_head_dim = asymmetric ||
+        (query_head_dim == value_head_dim &&
+         (query_head_dim == 64 || query_head_dim == 72 ||
+          query_head_dim == 80 || query_head_dim == 96 ||
+          query_head_dim == 128 || query_head_dim == 192 ||
+          query_head_dim == 256 || (query_head_dim == 512 && supports_d512)));
     if (!supported_head_dim) {
       msg << "the full attention kernel supports head dims "
-          << "{64, 72, 80, 96, 128, 192, 256} with matching query/value head "
-          << "dims; got query head dim " << query_head_dim
-          << " and value head dim " << value_head_dim << ".";
+          << "{64, 72, 80, 96, 128, 192, 256} with matching query/value dims, "
+          << "or (query, value) head dims (96, 64), "
+          << "plus head dim 512 on NAX GPUs (float32 also requires TF32); got "
+          << "query head dim " << query_head_dim << " and value head dim "
+          << value_head_dim << ".";
       return {false, msg.str()};
     }
     if (has_mask && !has_arr_mask &&
@@ -683,13 +786,14 @@ std::tuple<bool, std::string> has_fused_kernel(
         (query_head_dim == value_head_dim &&
          (query_head_dim == 64 || query_head_dim == 96 ||
           query_head_dim == 128 || query_head_dim == 192 ||
-          query_head_dim == 256)) ||
-        (query_head_dim == 192 && value_head_dim == 128);
+          query_head_dim == 256 || query_head_dim == 512)) ||
+        (query_head_dim == 192 && value_head_dim == 128) ||
+        (query_head_dim == 96 && value_head_dim == 64);
     if (!supported_head_dim) {
       msg << "the vector attention kernel supports head dims "
-          << "{64, 96, 128, 192, 256} with matching query/value head dims, "
-          << "or query head dim 192 with value head dim 128; got query head "
-          << "dim " << query_head_dim << " and value head dim "
+          << "{64, 96, 128, 192, 256, 512} with matching query/value head "
+          << "dims, or (query, value) head dims (96, 64) or (192, 128); got "
+          << "query head dim " << query_head_dim << " and value head dim "
           << value_head_dim << ".";
       return {false, msg.str()};
     }
@@ -705,6 +809,36 @@ std::tuple<bool, std::string> has_fused_kernel(
           << "the GQA factor to be at most 32; got query length "
           << query_sequence_length << " and GQA factor " << gqa_factor << ".";
       return {false, msg.str()};
+    }
+    // Head dim 512 uses the generic vector kernel, reading K/V is its main
+    // cost. By default, use it only for one query, GQA factor 8, and no array
+    // mask.
+    if (query_head_dim == 512) {
+      int min_key_sequence_length = env::get_var("MLX_SDPA_D512_MIN_KL", 1024);
+      bool always = (min_key_sequence_length == 0);
+      if (!always && query_sequence_length != 1) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "single-token queries; got query length "
+            << query_sequence_length << ".";
+        return {false, msg.str()};
+      }
+      if (!always && gqa_factor != 8) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "GQA factor 8; got GQA factor "
+            << gqa_factor << ".";
+        return {false, msg.str()};
+      }
+      if (!always && has_arr_mask) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "calls without array masks.";
+        return {false, msg.str()};
+      }
+      if (key_sequence_length < min_key_sequence_length) {
+        msg << "the vector attention kernel for head dim 512 requires at "
+            << "least " << min_key_sequence_length << " keys; got key length "
+            << key_sequence_length << ".";
+        return {false, msg.str()};
+      }
     }
   }
   return {true, ""};
@@ -749,12 +883,30 @@ bool ScaledDotProductAttention::use_fallback(
   const int query_head_dim = q.shape(-1);
   const int value_head_dim = v.shape(-1);
 
+  if (query_head_dim == 512 && query_sequence_length > 8) {
+    constexpr int64_t min_query_blocks = 1024;
+    const int64_t query_blocks = int64_t(q.shape(0)) * q.shape(1) *
+        int64_t(ceildiv(query_sequence_length, 32));
+    // The D512 kernel needs this many query blocks to match fallback speed.
+    const bool eligible = metal::is_nax_available() &&
+        (env::enable_tf32() || q.dtype() != float32) &&
+        query_sequence_length >= 1024 && do_causal && !has_arr_mask &&
+        query_blocks >= min_query_blocks;
+    return !eligible;
+  }
+
   // Use headdim-split kernel when NAX is enabled and there are enough query
   // blocks to fill the machine.
   if (metal::is_nax_available() &&
       (env::enable_tf32() || q.dtype() != float32) &&
-      query_sequence_length >= 1024 && query_head_dim == 256 && do_causal &&
-      !has_arr_mask) {
+      query_sequence_length >= 1024 && query_head_dim == 256 &&
+      (do_causal || has_arr_mask)) {
+    return false;
+  }
+
+  if (!metal::is_nax_available() && q.dtype() != float32 && do_causal &&
+      query_head_dim == 256 && query_sequence_length >= 2048 &&
+      query_sequence_length == k.shape(2)) {
     return false;
   }
 

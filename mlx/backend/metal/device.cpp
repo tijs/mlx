@@ -354,7 +354,7 @@ void CommandEncoder::set_input_array(
     int idx,
     int64_t offset /* = 0 */) {
   if (all_inputs_.insert(a.buffer().ptr()).second) {
-    buffer_sizes_ += a.data_size();
+    buffer_sizes_ += a.data_size() * a.itemsize();
     // See note in set_buffer above re: untracked-hazard / unretained-CB
     // contract. Retain on first sighting only.
     if (env::metal_retain_bound_buffers() && a.buffer().ptr()) {
@@ -967,8 +967,13 @@ CommandEncoder& get_command_encoder(Stream s) {
 }
 
 std::unordered_map<int, CommandEncoder>& get_command_encoders() {
-  static thread_local std::unordered_map<int, CommandEncoder> encoders;
-  return encoders;
+  if (is_main_thread()) {
+    static auto* encoders = new std::unordered_map<int, CommandEncoder>();
+    return *encoders;
+  } else {
+    static thread_local std::unordered_map<int, CommandEncoder> encoders;
+    return encoders;
+  }
 }
 
 std::unordered_map<int, CommandEncoder>& get_global_command_encoders() {

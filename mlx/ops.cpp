@@ -483,7 +483,7 @@ array unflatten(
     std::ostringstream msg;
     msg << "[unflatten] Invalid axes " << ax << " for array with " << a.ndim()
         << " dimensions.";
-    throw std::invalid_argument(msg.str());
+    throw std::out_of_range(msg.str());
   }
 
   size_t size = 1;
@@ -818,7 +818,7 @@ void normalize_dynamic_slice_inputs(
       std::ostringstream msg;
       msg << prefix << " Invalid axis " << ax << " for array with dimension "
           << a.ndim() << ".";
-      throw std::invalid_argument(msg.str());
+      throw std::out_of_range(msg.str());
     }
     ax = new_ax;
   }
@@ -1466,7 +1466,7 @@ array reflect_pad(
   Shape starts(a.ndim(), 0);
   auto stops = a.shape();
   for (size_t i = 0; i < axes.size(); i++) {
-    int ax = axes[i];
+    int ax = normalize_axis_index(axes[i], a.ndim(), "[pad] ");
     starts[ax] = low_pad_size[i];
     stops[ax] += low_pad_size[i];
   }
@@ -1474,7 +1474,7 @@ array reflect_pad(
   array padded = slice_update(out, a, starts, stops, s);
 
   for (size_t i = 0; i < axes.size(); i++) {
-    int ax = axes[i];
+    int ax = normalize_axis_index(axes[i], a.ndim(), "[pad] ");
     int n = a.shape(ax);
     int L = low_pad_size[i];
     int H = high_pad_size[i];
@@ -1547,37 +1547,41 @@ array edge_pad(
     const Shape& out_shape,
     StreamOrDevice s /* = {}*/) {
   array out = zeros(out_shape, a.dtype(), s);
-  auto stops = a.shape();
-  for (int i = 0; i < stops.size(); i++) {
-    stops[i] += low_pad_size[i];
+  Shape in_starts(a.ndim(), 0);
+  auto in_stops = a.shape();
+  for (size_t i = 0; i < axes.size(); i++) {
+    int ax = normalize_axis_index(axes[i], a.ndim(), "[pad] ");
+    in_starts[ax] = low_pad_size[i];
+    in_stops[ax] += low_pad_size[i];
   }
   // Copy over values from the unpadded array
-  array padded = slice_update(out, a, low_pad_size, stops, s);
+  array padded = slice_update(out, a, in_starts, in_stops, s);
 
-  for (int axis = 0; axis < a.ndim(); axis++) {
-    if (low_pad_size[axis] > 0) {
+  for (size_t i = 0; i < axes.size(); i++) {
+    int ax = normalize_axis_index(axes[i], a.ndim(), "[pad] ");
+    if (low_pad_size[i] > 0) {
       Shape starts(a.ndim(), 0);
-      starts[axis] = low_pad_size[axis];
+      starts[ax] = low_pad_size[i];
       auto stops = out.shape();
-      stops[axis] = low_pad_size[axis] + 1;
+      stops[ax] = low_pad_size[i] + 1;
       // Fetch edge values
       array edge_value = slice(padded, starts, stops, s);
 
-      starts[axis] = 0;
-      stops[axis] = low_pad_size[axis];
+      starts[ax] = 0;
+      stops[ax] = low_pad_size[i];
       // Update edge values in the padded array
       padded = slice_update(padded, edge_value, starts, stops, s);
     }
 
-    if (high_pad_size[axis] > 0) {
+    if (high_pad_size[i] > 0) {
       Shape starts(a.ndim(), 0);
-      starts[axis] = -high_pad_size[axis] - 1;
+      starts[ax] = -high_pad_size[i] - 1;
       auto stops = out.shape();
-      stops[axis] = -high_pad_size[axis];
+      stops[ax] = -high_pad_size[i];
       array edge_value = slice(padded, starts, stops, s);
 
-      starts[axis] = -high_pad_size[axis];
-      stops[axis] = out.shape(axis);
+      starts[ax] = -high_pad_size[i];
+      stops[ax] = out.shape(ax);
       padded = slice_update(padded, edge_value, starts, stops, s);
     }
   }
@@ -1619,7 +1623,7 @@ array pad(
       throw std::invalid_argument(msg.str());
     }
 
-    auto ax = axes[i] < 0 ? a.ndim() + axes[i] : axes[i];
+    auto ax = normalize_axis_index(axes[i], a.ndim(), "[pad] ");
     out_shape[ax] = safe_cast(
         static_cast<int64_t>(out_shape[ax]) + low_pad_size[i] +
             high_pad_size[i],
@@ -1755,7 +1759,7 @@ array transpose(
   }
   if (axes.size() != a.ndim()) {
     std::ostringstream msg;
-    msg << "[transpose] Recived " << axes.size() << " axes for array with "
+    msg << "[transpose] Received " << axes.size() << " axes for array with "
         << a.ndim() << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
@@ -1767,7 +1771,7 @@ array transpose(
       std::ostringstream msg;
       msg << "[transpose] Invalid axis (" << ax << ") for array with "
           << a.ndim() << " dimensions.";
-      throw std::invalid_argument(msg.str());
+      throw std::out_of_range(msg.str());
     }
     if (shape[ax] != 0) {
       throw std::invalid_argument("[transpose] Repeat axes not allowed.");
@@ -1788,6 +1792,17 @@ array transpose(
 array transpose(const array& a, StreamOrDevice s /* = {} */) {
   std::vector<int> axes(a.ndim());
   std::iota(axes.rbegin(), axes.rend(), 0);
+  return transpose(a, std::move(axes), to_stream(s));
+}
+
+array matrix_transpose(const array& a, StreamOrDevice s /* = {} */) {
+  if (a.ndim() < 2) {
+    throw std::invalid_argument(
+        "[matrix_transpose] Input array must have at least 2 dimensions.");
+  }
+  std::vector<int> axes(a.ndim());
+  std::iota(axes.begin(), axes.end(), 0);
+  std::swap(axes[a.ndim() - 1], axes[a.ndim() - 2]);
   return transpose(a, std::move(axes), to_stream(s));
 }
 
@@ -2330,7 +2345,7 @@ array mean(
       std::ostringstream msg;
       msg << "[mean] axis " << axis << " is out of bounds for array with "
           << ndim << " dimensions.";
-      throw std::invalid_argument(msg.str());
+      throw std::out_of_range(msg.str());
     }
   }
   auto dtype = at_least_float(a.dtype());
@@ -2364,7 +2379,7 @@ array median(
       std::ostringstream msg;
       msg << "[median] axis " << axis << " is out of bounds for array with "
           << ndim << " dimensions.";
-      throw std::invalid_argument(msg.str());
+      throw std::out_of_range(msg.str());
     }
     set_axes.insert(axis < 0 ? axis + ndim : axis);
   }
@@ -3151,8 +3166,14 @@ array floor_divide(
 
   auto inputs = broadcast_arrays({astype(a, dtype, s), astype(b, dtype, s)}, s);
   auto shape = inputs[0].shape();
-  return array(
+  auto quotient = array(
       shape, dtype, std::make_shared<Divide>(to_stream(s)), std::move(inputs));
+  auto rem = remainder(a, b, s);
+  auto zero = array(0, dtype);
+  auto step = logical_and(
+      not_equal(rem, zero, s),
+      not_equal(less(a, zero, s), less(b, zero, s), s));
+  return subtract(quotient, astype(step, dtype, s), s);
 }
 
 array remainder(const array& a, const array& b, StreamOrDevice s /* = {} */) {
@@ -3674,7 +3695,7 @@ array take(
     std::ostringstream msg;
     msg << "[take] Received invalid axis " << axis << " for array with "
         << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
+    throw std::out_of_range(msg.str());
   }
 
   // Check for valid take
@@ -3719,7 +3740,7 @@ array take(const array& a, int index, int axis, StreamOrDevice s /* = {} */) {
     std::ostringstream msg;
     msg << "[take] Received invalid axis " << axis << " for array with "
         << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
+    throw std::out_of_range(msg.str());
   }
 
   // Check for valid take
@@ -4145,14 +4166,7 @@ array cumsum(
     bool inclusive /* = true*/,
     std::optional<Dtype> dtype /* = std::nullopt*/,
     StreamOrDevice s /* = {}*/) {
-  int ndim = a.ndim();
-  if (axis >= ndim || axis < -ndim) {
-    std::ostringstream msg;
-    msg << "[cumsum] Axis " << axis << " is out of bounds for array with "
-        << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  axis = (axis + a.ndim()) % a.ndim();
+  axis = normalize_axis_index(axis, a.ndim(), "[cumsum] ");
   auto x = dtype ? astype(a, *dtype, s) : a;
   auto out_type = x.dtype() == bool_ ? int32 : x.dtype();
   return array(
@@ -4180,14 +4194,7 @@ array cumprod(
     bool inclusive /* = true*/,
     std::optional<Dtype> dtype /* = std::nullopt*/,
     StreamOrDevice s /* = {}*/) {
-  int ndim = a.ndim();
-  if (axis >= ndim || axis < -ndim) {
-    std::ostringstream msg;
-    msg << "[cumprod] Axis " << axis << " is out of bounds for array with "
-        << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  axis = (axis + a.ndim()) % a.ndim();
+  axis = normalize_axis_index(axis, a.ndim(), "[cumprod] ");
   auto x = dtype ? astype(a, *dtype, s) : a;
   return array(
       x.shape(),
@@ -4212,14 +4219,7 @@ array cummax(
     bool reverse /* = false*/,
     bool inclusive /* = true*/,
     StreamOrDevice s /* = {}*/) {
-  int ndim = a.ndim();
-  if (axis >= ndim || axis < -ndim) {
-    std::ostringstream msg;
-    msg << "[cummax] Axis " << axis << " is out of bounds for array with "
-        << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  axis = (axis + a.ndim()) % a.ndim();
+  axis = normalize_axis_index(axis, a.ndim(), "[cummax] ");
   return array(
       a.shape(),
       a.dtype(),
@@ -4242,14 +4242,7 @@ array cummin(
     bool reverse /* = false*/,
     bool inclusive /* = true*/,
     StreamOrDevice s /* = {}*/) {
-  int ndim = a.ndim();
-  if (axis >= ndim || axis < -ndim) {
-    std::ostringstream msg;
-    msg << "[cummin] Axis " << axis << " is out of bounds for array with "
-        << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  axis = (axis + a.ndim()) % a.ndim();
+  axis = normalize_axis_index(axis, a.ndim(), "[cummin] ");
   return array(
       a.shape(),
       a.dtype(),
@@ -4274,7 +4267,7 @@ array diff(
   int ndim = static_cast<int>(a.ndim());
   int ax = axis < 0 ? axis + ndim : axis;
   if (ax < 0 || ax >= ndim) {
-    throw std::invalid_argument("[diff] Axis is out of bounds for the array.");
+    throw std::out_of_range("[diff] Axis is out of bounds for the array.");
   }
   if (n < 0) {
     throw std::invalid_argument("[diff] Order `n` must be non-negative.");
@@ -4299,14 +4292,7 @@ array logcumsumexp(
     bool reverse /* = false*/,
     bool inclusive /* = true*/,
     StreamOrDevice s /* = {}*/) {
-  int ndim = a.ndim();
-  if (axis >= ndim || axis < -ndim) {
-    std::ostringstream msg;
-    msg << "[logcumsumexp] Axis " << axis << " is out of bounds for array with "
-        << a.ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
-  }
-  axis = (axis + a.ndim()) % a.ndim();
+  axis = normalize_axis_index(axis, a.ndim(), "[logcumsumexp] ");
   return array(
       a.shape(),
       a.dtype(),
@@ -5064,10 +5050,10 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
     throw std::invalid_argument(msg.str());
   }
 
-  if (bits < 2 || bits > 8 || bits == 7) {
+  if (bits < 1 || bits > 8 || bits == 7) {
     std::ostringstream msg;
     msg << "[quantize] The requested number of bits " << bits
-        << " is not supported. The supported bits are 2, 3, 4, 5, 6 and 8.";
+        << " is not supported. The supported bits are 1, 2, 3, 4, 5, 6 and 8.";
     throw std::invalid_argument(msg.str());
   }
 
@@ -5088,14 +5074,22 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
     w_max = astype(w_max, float32, s);
     w_min = astype(w_min, float32, s);
 
-    array mask = greater(abs(w_min, s), abs(w_max, s), s);
-    array scales =
-        maximum(divide(subtract(w_max, w_min, s), n_bins, s), eps, s);
-    scales = where(mask, scales, negative(scales, s), s);
-    array edge = where(mask, w_min, w_max, s);
-    array q0 = round(divide(edge, scales, s), s);
-    scales = where(not_equal(q0, zero, s), divide(edge, q0, s), scales);
-    array biases = where(equal(q0, zero, s), zero, edge, s);
+    array scales(0, float32);
+    array biases(0, float32);
+
+    if (bits == 1) {
+      // Affine 1-bit: bit 0 -> w_min, bit 1 -> w_max
+      scales = maximum(subtract(w_max, w_min, s), eps, s);
+      biases = w_min;
+    } else {
+      array mask = greater(abs(w_min, s), abs(w_max, s), s);
+      scales = maximum(divide(subtract(w_max, w_min, s), n_bins, s), eps, s);
+      scales = where(mask, scales, negative(scales, s), s);
+      array edge = where(mask, w_min, w_max, s);
+      array q0 = round(divide(edge, scales, s), s);
+      scales = where(not_equal(q0, zero, s), divide(edge, q0, s), scales);
+      biases = where(equal(q0, zero, s), zero, edge, s);
+    }
 
     packed_w = pack_and_quantize(packed_w, scales, biases, bits, s);
 
@@ -5589,9 +5583,14 @@ array gather_qmm(
     std::optional<int> group_size_ /* = std::nullopt */,
     std::optional<int> bits_ /* = std::nullopt */,
     const std::string& mode /* = "affine" */,
+    const std::optional<array>& global_scale /* = std::nullopt */,
     bool sorted_indices /* = false */,
     StreamOrDevice s /* = {} */) {
   if (!lhs_indices_ && !rhs_indices_) {
+    if (global_scale) {
+      throw std::invalid_argument(
+          "[gather_qmm] Global scale is not supported without indices.");
+    }
     return quantized_matmul(
         x, w, scales, biases, transpose, group_size_, bits_, mode, s);
   }
@@ -5602,11 +5601,54 @@ array gather_qmm(
       quantization_params_from_mode(qmode, group_size_, bits_);
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
       "gather_qmm", x, w, scales, biases, transpose, group_size, bits);
-  const bool mixed_bf16_f16_qmv = qmode == QuantizationMode::Affine &&
-      transpose && x.dtype() == bfloat16 && out_type == float16 && biases &&
-      biases->dtype() == float16 && group_size == 64 &&
-      (bits == 4 || bits == 8) && x.shape(-2) == 1 && w_inner_dims % 512 == 0 &&
-      w_outer_dims % 8 == 0;
+  if (global_scale) {
+    if (qmode != QuantizationMode::Nvfp4) {
+      throw std::invalid_argument(
+          "[gather_qmm] Global scale is only supported for 'nvfp4' "
+          "quantization mode.");
+    }
+    if (global_scale->dtype() != float32) {
+      std::ostringstream msg;
+      msg << "[gather_qmm] Global scale must have dtype float32 but got "
+          << global_scale->dtype() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    // One scale per expert, so it matches the batch dimensions of w.
+    Shape expected(w.shape().begin(), w.shape().end() - 2);
+    if (global_scale->shape() != expected) {
+      std::ostringstream msg;
+      msg << "[gather_qmm] Global scale must have one entry per expert with "
+          << "shape " << expected << " but got " << global_scale->shape()
+          << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (to_stream(s).device != Device::gpu) {
+      throw std::invalid_argument(
+          "[gather_qmm] Global scale is only supported on the GPU.");
+    }
+  }
+  // Extract indices and broadcast them
+  array lhs_indices = indices_or_default("[gather_qmm]", lhs_indices_, x, s);
+  array rhs_indices = indices_or_default("[gather_qmm]", rhs_indices_, w, s);
+  std::tie(lhs_indices, rhs_indices) =
+      broadcast_arrays(lhs_indices, rhs_indices, s);
+
+  // Match GatherQMM::eval_gpu: only Metal's vector consumer supports mixed
+  // BF16/F16 storage. Sorted matrix rows need normal dtype promotion.
+  const auto experts = std::accumulate(
+      w.shape().begin(),
+      w.shape().end() - 2,
+      size_t{1},
+      std::multiplies<size_t>{});
+  const bool sorted_rhs_matrix = sorted_indices && !lhs_indices_ &&
+      x.shape(-2) == 1 && rhs_indices.size() >= 16 && experts > 0 &&
+      rhs_indices.size() / experts >= 4;
+  const bool mixed_bf16_f16_qmv = to_stream(s).device == Device::gpu &&
+      metal::is_available() && !sorted_rhs_matrix &&
+      qmode == QuantizationMode::Affine && transpose && x.dtype() == bfloat16 &&
+      out_type == float16 && biases && biases->dtype() == float16 &&
+      group_size == 64 && (bits == 4 || bits == 8) && x.shape(-2) == 1 &&
+      w_inner_dims % 512 == 0 && w_outer_dims % 8 == 0;
   if (qmode == QuantizationMode::Affine) {
     out_type =
         mixed_bf16_f16_qmv ? x.dtype() : promote_types(x.dtype(), out_type);
@@ -5620,12 +5662,6 @@ array gather_qmm(
         << "x.dtype() == " << x.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
-
-  // Extract indices and broadcast them
-  array lhs_indices = indices_or_default("[gather_qmm]", lhs_indices_, x, s);
-  array rhs_indices = indices_or_default("[gather_qmm]", rhs_indices_, w, s);
-  std::tie(lhs_indices, rhs_indices) =
-      broadcast_arrays(lhs_indices, rhs_indices, s);
 
   // Compute the full output shape
   auto out_shape = lhs_indices.shape();
@@ -5644,12 +5680,12 @@ array gather_qmm(
               std::move(lhs_indices),
               std::move(rhs_indices)};
   } else {
-    inputs = {
-        astype(x, out_type, s),
-        std::move(w),
-        std::move(scales),
-        std::move(lhs_indices),
-        std::move(rhs_indices)};
+    inputs = {astype(x, out_type, s), std::move(w), std::move(scales)};
+    if (global_scale) {
+      inputs.push_back(*global_scale);
+    }
+    inputs.push_back(std::move(lhs_indices));
+    inputs.push_back(std::move(rhs_indices));
   }
   return array(
       std::move(out_shape),
@@ -5711,7 +5747,13 @@ array gather_qqmm(
   return array(
       std::move(out_shape),
       x.dtype(),
-      std::make_shared<GatherQQMM>(stream, group_size, bits, qmode),
+      std::make_shared<GatherQQMM>(
+          stream,
+          group_size,
+          bits,
+          qmode,
+          sorted_indices && !rhs_indices_,
+          sorted_indices && !lhs_indices_),
       std::move(inputs));
 }
 
@@ -5827,7 +5869,7 @@ array vecdot(
   }
   int ax = axis < 0 ? axis + a.ndim() : axis;
   if (ax < 0 || ax >= a.ndim()) {
-    throw std::invalid_argument("[vecdot] axis is out of bounds.");
+    throw std::out_of_range("[vecdot] axis is out of bounds.");
   }
   if (axis < 0 ? axis + b.ndim() != ax : axis >= b.ndim()) {
     throw std::invalid_argument("[vecdot] axis is out of bounds.");
@@ -6708,7 +6750,7 @@ array roll(
       std::ostringstream msg;
       msg << "[roll] Invalid axis " << axes[i] << " for array with " << a.ndim()
           << " dimensions.";
-      throw std::invalid_argument(msg.str());
+      throw std::out_of_range(msg.str());
     }
 
     auto sh = shift[i];

@@ -76,6 +76,9 @@ class ArrayAt {
 class ArrayPythonIterator {
  public:
   ArrayPythonIterator(mx::array x) : idx_(0), x_(std::move(x)) {
+    if (x_.ndim() == 0) {
+      throw nb::type_error("iter() 0-dimensional array.");
+    }
     if (x_.shape(0) > 0 && x_.shape(0) < 10) {
       splits_ = mx::split(x_, x_.shape(0));
     }
@@ -1035,6 +1038,23 @@ void init_array(nb::module_& m) {
             return nb::cast<std::complex<double>>(to_scalar(a));
           })
       .def(
+          "__index__",
+          [](mx::array& a) {
+            if (!mx::issubdtype(a.dtype(), mx::integer) || a.ndim() != 0) {
+              throw nb::type_error(
+                  "Only 0-dimensional integer arrays can be converted to an index.");
+            }
+            return nb::int_(to_scalar(a));
+          })
+      .def(
+          "__bytes__",
+          [](mx::array& a) {
+            auto c = mx::contiguous(a);
+            c.eval();
+            return nb::bytes(
+                reinterpret_cast<const char*>(c.data<void>()), c.nbytes());
+          })
+      .def(
           "__format__",
           [](mx::array& a, nb::object format_spec) {
             if (nb::len(nb::str(format_spec)) > 0 && a.ndim() > 0) {
@@ -1248,6 +1268,10 @@ void init_array(nb::module_& m) {
           "T",
           [](const mx::array& a) { return mx::transpose(a); },
           "Equivalent to calling ``self.transpose()`` with no arguments.")
+      .def_prop_ro(
+          "mT",
+          [](const mx::array& a) { return mx::matrix_transpose(a); },
+          "Equivalent to calling ``self.transpose()`` with the last two axes swapped.")
       .def(
           "sum",
           [](const mx::array& a,
@@ -1352,7 +1376,9 @@ void init_array(nb::module_& m) {
              const IntOrVec& axis,
              bool keepdims,
              int ddof,
+             std::optional<int> correction,
              mx::StreamOrDevice s) {
+            ddof = correction.value_or(ddof);
             return mx::std(
                 a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
           },
@@ -1360,6 +1386,7 @@ void init_array(nb::module_& m) {
           "keepdims"_a = false,
           "ddof"_a = 0,
           nb::kw_only(),
+          "correction"_a = nb::none(),
           "stream"_a = nb::none(),
           "See :func:`std`.")
       .def(
@@ -1368,7 +1395,9 @@ void init_array(nb::module_& m) {
              const IntOrVec& axis,
              bool keepdims,
              int ddof,
+             std::optional<int> correction,
              mx::StreamOrDevice s) {
+            ddof = correction.value_or(ddof);
             return mx::var(
                 a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
           },
@@ -1376,6 +1405,7 @@ void init_array(nb::module_& m) {
           "keepdims"_a = false,
           "ddof"_a = 0,
           nb::kw_only(),
+          "correction"_a = nb::none(),
           "stream"_a = nb::none(),
           "See :func:`var`.")
       .def(

@@ -1,5 +1,6 @@
 // Copyright © 2023-2026 Apple Inc.
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -11,8 +12,10 @@
 #include "mlx/allocator.h"
 #include "mlx/device.h"
 #include "mlx/memory.h"
+#include "mlx/ops.h"
 #include "mlx/scheduler.h"
 #include "mlx/stream.h"
+#include "mlx/transforms.h"
 
 using namespace mlx::core;
 
@@ -66,6 +69,24 @@ TEST_CASE("test cached allocation keeps capacity") {
   set_cache_limit(old_limit);
 }
 
+TEST_CASE("test array buffer size") {
+  auto a = array({1.0f, 2.0f, 3.0f, 4.0f});
+  auto view = reshape(a, {2, 2});
+
+  CHECK_THROWS_AS(get_array_buffer_size({view}), std::invalid_argument);
+
+  eval(view);
+  auto a_size = a.buffer_size();
+  CHECK_EQ(get_array_buffer_size({}), 0);
+  CHECK_EQ(get_array_buffer_size({a}), a_size);
+  CHECK_EQ(get_array_buffer_size({a, a}), a_size);
+  CHECK_EQ(get_array_buffer_size({a, view}), a_size);
+
+  auto b = array({5.0f, 6.0f});
+  CHECK_EQ(get_array_buffer_size({a, b}), a_size + b.buffer_size());
+  CHECK_EQ(get_array_buffer_size({array({})}), 0);
+}
+
 TEST_CASE("test clear cache synchronizes cpu streams") {
   if (is_available(Device{Device::gpu})) {
     return;
@@ -117,4 +138,95 @@ TEST_CASE("test clear cache synchronizes cpu streams") {
   clear_thread.join();
 
   set_cache_limit(old_limit);
+}
+
+TEST_CASE("test concurrent allocator statistics") {
+  // The linked backend supplies the actual allocator (CPU or Metal). Only tiny
+  // buffers are allocated; no array graph, model or shader is needed.
+  clear_cache();
+  const auto initial_active = get_active_memory();
+  const auto initial_limit = get_memory_limit();
+  std::atomic<bool> start{false};
+  bool allocation_failed = false;
+  size_t observations = 0;
+  std::thread writer([&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    try {
+      for (int i = 0; i < 10000; ++i) {
+        auto buffer = allocator::malloc((i & 1) ? 4096 : 8192);
+        if (buffer.ptr() == nullptr) {
+          allocation_failed = true;
+          break;
+        }
+        allocator::free(buffer);
+        if ((i & 63) == 0) {
+          std::this_thread::yield();
+        }
+      }
+    } catch (...) {
+      allocation_failed = true;
+    }
+  });
+  std::thread reader([&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 100000; ++i) {
+      observations += get_active_memory();
+      observations += get_peak_memory();
+      observations += get_cache_memory();
+      if ((i & 63) == 0) {
+        std::this_thread::yield();
+      }
+    }
+  });
+  start.store(true, std::memory_order_release);
+  writer.join();
+  reader.join();
+  INFO("statistics checksum: ", observations);
+  CHECK_FALSE(allocation_failed);
+  CHECK_EQ(get_active_memory(), initial_active);
+  CHECK_EQ(get_memory_limit(), initial_limit);
+  clear_cache();
+  CHECK_EQ(get_cache_memory(), 0);
+}
+
+TEST_CASE("test concurrent allocator limit and peak observations") {
+  const auto initial_limit = get_memory_limit();
+  std::atomic<bool> start{false};
+  bool wrong_limit = false;
+  size_t observations = 0;
+  std::thread writer([&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 10000; ++i) {
+      // Exercise setter/read synchronization without changing the limit value.
+      set_memory_limit(initial_limit);
+      reset_peak_memory();
+      if ((i & 63) == 0) {
+        std::this_thread::yield();
+      }
+    }
+  });
+  std::thread reader([&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int i = 0; i < 100000; ++i) {
+      wrong_limit |= get_memory_limit() != initial_limit;
+      observations += get_peak_memory();
+      if ((i & 63) == 0) {
+        std::this_thread::yield();
+      }
+    }
+  });
+  start.store(true, std::memory_order_release);
+  writer.join();
+  reader.join();
+  INFO("peak checksum: ", observations);
+  CHECK_FALSE(wrong_limit);
+  CHECK_EQ(get_memory_limit(), initial_limit);
 }

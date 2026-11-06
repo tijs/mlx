@@ -2,8 +2,13 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "doctest/doctest.h"
 
@@ -253,6 +258,104 @@ TEST_CASE("test gguf tensor data offset validation") {
     // silently. Pins the offset bound to the file size exactly.
     std::string file_path = get_temp_file("test_gguf_offset_just_past.gguf");
     write_raw_gguf(file_path, 20);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+}
+
+// Writes a one-tensor GGUF whose tensor header carries `dims` and `type`
+// verbatim, so a test can drive the dimension product independently of the
+// amount of tensor data in the file. The name ends in ".weight" because the
+// quantized loader derives the scales and biases names from it.
+void write_raw_gguf_dims(
+    const std::string& path,
+    const std::vector<uint64_t>& dims,
+    uint32_t type,
+    size_t data_bytes) {
+  std::ofstream out(path, std::ios::binary);
+  auto u32 = [&out](uint32_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 4);
+  };
+  auto u64 = [&out](uint64_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 8);
+  };
+  out.write("GGUF", 4);
+  u32(3); // version
+  u64(1); // tensor_count
+  u64(0); // metadata_kv_count
+  u64(8); // tensor name length
+  out.write("w.weight", 8);
+  u32(dims.size());
+  for (auto dim : dims) {
+    u64(dim);
+  }
+  u32(type);
+  u64(0); // tensor data offset
+  while (out.tellp() % 32 != 0) { // default GGUF alignment
+    out.put(0);
+  }
+  std::vector<char> data(data_bytes, 0);
+  out.write(data.data(), data.size());
+}
+
+TEST_CASE("test gguf tensor dimension validation") {
+  // The element count exists in two widths: gguflib keeps the 64 bit product in
+  // tensor.num_weights, and get_shape narrows each dimension to a 32 bit
+  // ShapeElem. Only the byte size is checked against the file, so dimensions
+  // that make the two disagree size a buffer from one and index it with the
+  // other. See ml-explore/mlx#4244.
+  const uint32_t q8_0 = 8;
+
+  SUBCASE("valid quantized tensor loads") {
+    std::string file_path = get_temp_file("test_gguf_dims_ok.gguf");
+    // One block of 32 weights: 2 bytes of scale plus 32 bytes of weights.
+    write_raw_gguf_dims(file_path, {32}, q8_0, 34);
+    auto [weights, metadata] = load_gguf(file_path);
+    CHECK_EQ(weights.at("w.weight").shape(), Shape{8});
+    CHECK_EQ(weights.at("w.scales").shape(), Shape{1});
+    CHECK_EQ(weights.at("w.biases").shape(), Shape{1});
+  }
+
+  SUBCASE("dimension past the ShapeElem range") {
+    // Narrows to a shape of 32 that no longer describes the file.
+    std::string file_path = get_temp_file("test_gguf_dim_narrowed.gguf");
+    write_raw_gguf_dims(file_path, {(1ull << 32) + 32}, q8_0, 34);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("dimension that narrows to a negative shape") {
+    std::string file_path = get_temp_file("test_gguf_dim_negative.gguf");
+    write_raw_gguf_dims(file_path, {1ull << 31}, q8_0, 34);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("dimension product that wraps to a small byte size") {
+    // 96 * 384307168202282326 wraps to 64, so the tensor needs only 68 bytes of
+    // data and passes the byte size check, while the narrowed shape
+    // {1431655766, 96} still describes 2^37 elements. That drives the scales
+    // element count past INT32_MAX, which is what truncates the allocation size
+    // while the extractor still loops over the full count.
+    std::string file_path = get_temp_file("test_gguf_dim_wrap.gguf");
+    write_raw_gguf_dims(file_path, {96, 384307168202282326ull}, q8_0, 68);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("dimension product that wraps to zero") {
+    // Wraps num_weights to exactly 0, so the tensor claims no data at all.
+    std::string file_path = get_temp_file("test_gguf_dim_wrap_zero.gguf");
+    write_raw_gguf_dims(
+        file_path,
+        {(1ull << 32) + (1ull << 25),
+         (1ull << 32) + (1ull << 15),
+         (1ull << 32) + (1ull << 24)},
+        q8_0,
+        0);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("tensor without dimensions") {
+    // gguf_load_quantized indexes the last shape element unconditionally.
+    std::string file_path = get_temp_file("test_gguf_no_dims.gguf");
+    write_raw_gguf_dims(file_path, {}, q8_0, 0);
     CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
   }
 }
@@ -556,3 +659,407 @@ TEST_CASE("test single array serialization") {
     CHECK(array_equal(a, b).item<bool>());
   }
 }
+
+#ifndef _WIN32
+namespace {
+struct NamedMmapFixture {
+  std::string path;
+  size_t page = static_cast<size_t>(getpagesize());
+  NamedMmapFixture() {
+    auto pattern = get_temp_file("mlx-named-mmap-XXXXXX");
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    const int fd = mkstemp(name.data());
+    if (fd < 0) {
+      throw std::runtime_error("temporary mmap fixture creation failed");
+    }
+    path = name.data();
+    const int result = ftruncate(fd, static_cast<off_t>(page * 4));
+    close(fd);
+    if (result != 0) {
+      std::filesystem::remove(path);
+      throw std::runtime_error("temporary mmap fixture sizing failed");
+    }
+  }
+  ~NamedMmapFixture() {
+    std::filesystem::remove(path);
+  }
+};
+} // namespace
+
+TEST_CASE("named mmap banks register expert ranges and release weak owners") {
+  NamedMmapFixture file;
+  constexpr int32_t layer = 1900000000;
+  const auto prefix = "model.layers.1900000000.mlp.switch_mlp.gate_proj.tq2_";
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  for (bool packed : {true, false}) {
+    std::optional<array> retained;
+    {
+      const Shape shape = packed ? Shape{2, static_cast<int>(file.page / 4), 1}
+                                 : Shape{2, static_cast<int>(file.page / 2)};
+      // Zero-copy adoption is currently implemented only by MetalAllocator.
+      // Other backends must reject the region without retaining a registry
+      // entry; exercise that contract rather than assuming Metal on Linux CI.
+      if (!metal::is_available()) {
+        CHECK_THROWS_WITH_AS(
+            mmap_file_region_named(
+                file.path,
+                file.page,
+                2 * file.page,
+                shape,
+                packed ? uint32 : float16,
+                std::string(prefix) + (packed ? "packed" : "scales")),
+            ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+            std::runtime_error);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+        continue;
+      }
+      auto bank = mmap_file_region_named(
+          file.path,
+          file.page,
+          2 * file.page,
+          shape,
+          packed ? uint32 : float16,
+          std::string(prefix) + (packed ? "packed" : "scales"));
+      CHECK_EQ(bank.shape(), shape);
+      CHECK_EQ(
+          safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+      int32_t selected_layer = layer;
+      int32_t expert = 1;
+      CHECK_EQ(
+          safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1),
+          file.page);
+      CHECK_EQ(
+          safetensors_mmap_advise_experts(0, &selected_layer, &expert, 1),
+          file.page);
+      expert = 2;
+      CHECK_EQ(
+          safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1), 0);
+      CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 2 * file.page);
+      retained = bank;
+    }
+    CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+    retained.reset();
+    CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+    CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+  }
+}
+
+TEST_CASE("wrapped routed named mmap preserves expert advice and weak ownership") {
+  NamedMmapFixture file;
+  constexpr int32_t layer = 1900000003;
+  const auto prefix = "language_model.model.layers.1900000003.mlp.switch_mlp.";
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  for (const auto* role : {"gate", "up", "down"}) {
+    for (bool packed : {true, false}) {
+      const Shape shape = packed ? Shape{2, static_cast<int>(file.page / 4), 1}
+                                 : Shape{2, static_cast<int>(file.page / 2)};
+      const auto name = std::string(prefix) + role + "_proj.tq2_" +
+          (packed ? "packed" : "scales");
+      if (!metal::is_available()) {
+        CHECK_THROWS_WITH_AS(
+            mmap_file_region_named(
+                file.path, file.page, 2 * file.page, shape,
+                packed ? uint32 : float16, name),
+            ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+            std::runtime_error);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+        continue;
+      }
+      std::optional<array> retained;
+      {
+        auto bank = mmap_file_region_named(
+            file.path, file.page, 2 * file.page, shape,
+            packed ? uint32 : float16, name);
+        CHECK_EQ(bank.shape(), shape);
+        CHECK_EQ(bank.dtype(), packed ? uint32 : float16);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+        int32_t selected_layer = layer, expert = 1;
+        CHECK_EQ(safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1), file.page);
+        CHECK_EQ(safetensors_mmap_advise_experts(0, &selected_layer, &expert, 1), file.page);
+        expert = 2;
+        CHECK_EQ(safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1), 0);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 2 * file.page);
+        retained = bank;
+      }
+      CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+      retained.reset();
+      CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+      CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+    }
+  }
+  for (const auto* name : {
+           "language_model.layers.0.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_model.language_model.model.layers.0.mlp.switch_mlp.gate_proj.tq2_packed",
+           "model.language_model.model.layers.0.mlp.switch_mlp.up_proj.tq2_packed",
+           "language_model.model.model.layers.0.mlp.switch_mlp.down_proj.tq2_packed",
+           "vision_model.model.layers.0.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_modelx.model.layers.0.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_model.model.layers.00.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_model.model.layers.-1.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_model.model.layers.2147483648.mlp.switch_mlp.gate_proj.tq2_packed",
+           "language_model.model.layers.0.mlp.switch_mlp.gate_proj.tq2_packed.extra"}) {
+    CHECK_THROWS_AS(
+        mmap_file_region_named(file.path, file.page, 2 * file.page,
+                              {2, static_cast<int>(file.page / 4), 1}, uint32, name),
+        std::invalid_argument);
+  }
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+
+TEST_CASE("LFM named mmap admits canonical feed_forward expert banks") {
+  NamedMmapFixture file;
+  constexpr int32_t layer = 1900000002;
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  for (const auto* role : {"gate", "up", "down"}) {
+    for (bool packed : {true, false}) {
+      const Shape shape = packed ? Shape{2, static_cast<int>(file.page / 4), 1}
+                                 : Shape{2, static_cast<int>(file.page / 2)};
+      const auto name = "model.layers.1900000002.feed_forward.switch_mlp." +
+          std::string(role) + "_proj.tq2_" + (packed ? "packed" : "scales");
+      if (!metal::is_available()) {
+        CHECK_THROWS_WITH_AS(
+            mmap_file_region_named(file.path, file.page, 2 * file.page, shape,
+                                   packed ? uint32 : float16, name),
+            ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+            std::runtime_error);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+        continue;
+      }
+      {
+        auto bank = mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                          shape, packed ? uint32 : float16, name);
+        CHECK_EQ(bank.shape(), shape);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+        int32_t selected_layer = layer, expert = 1;
+        CHECK_EQ(safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1), file.page);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 2 * file.page);
+      }
+      CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+      CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+    }
+  }
+  for (const auto* name : {
+           "model.layers.00.feed_forward.switch_mlp.gate_proj.tq2_packed",
+           "model.layers.2147483648.feed_forward.switch_mlp.gate_proj.tq2_packed",
+           "model.layers.0.feed_forward.gate_proj.tq2_packed",
+           "model.layers.0.feed_forward.switch_mlp.router_proj.tq2_packed",
+           "model.layers.0.feed_forward.switch_mlp.gate_proj.weight"}) {
+    CHECK_THROWS_AS(mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                          {2, static_cast<int>(file.page / 4), 1}, uint32, name),
+                    std::invalid_argument);
+  }
+  CHECK_THROWS_AS(mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                        {2, static_cast<int>(file.page / 4), 1}, float32,
+                                        "model.layers.0.feed_forward.switch_mlp.gate_proj.tq2_packed"),
+                  std::invalid_argument);
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+
+TEST_CASE("Nemotron-H named mmap admits canonical relu2 fc1/fc2 expert banks") {
+  NamedMmapFixture file;
+  constexpr int32_t layer = 1900000003;
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  for (const auto* role : {"fc1", "fc2"}) {
+    for (bool packed : {true, false}) {
+      const Shape shape = packed ? Shape{2, static_cast<int>(file.page / 4), 1}
+                                 : Shape{2, static_cast<int>(file.page / 2)};
+      const auto name = "backbone.layers.1900000003.mixer.switch_mlp." +
+          std::string(role) + ".tq2_" + (packed ? "packed" : "scales");
+      if (!metal::is_available()) {
+        CHECK_THROWS_WITH_AS(
+            mmap_file_region_named(file.path, file.page, 2 * file.page, shape,
+                                   packed ? uint32 : float16, name),
+            ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+            std::runtime_error);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+        continue;
+      }
+      {
+        auto bank = mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                          shape, packed ? uint32 : float16, name);
+        CHECK_EQ(bank.shape(), shape);
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline + 2 * file.page);
+        int32_t selected_layer = layer, expert = 1;
+        CHECK_EQ(safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1), file.page);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 2 * file.page);
+      }
+      CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+      CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+    }
+  }
+  for (const auto* name : {
+           "backbone.layers.00.mixer.switch_mlp.fc1.tq2_packed",
+           "backbone.layers.2147483648.mixer.switch_mlp.fc1.tq2_packed",
+           "backbone.layers.0.mixer.fc1.tq2_packed",
+           "backbone.layers.0.mixer.switch_mlp.fc3.tq2_packed",
+           "backbone.layers.0.mixer.switch_mlp.gate_proj.tq2_packed",
+           "language_model.backbone.layers.0.mixer.switch_mlp.fc1.tq2_packed",
+           "backbone.layers.0.mixer.switch_mlp.fc1.weight"}) {
+    CHECK_THROWS_AS(mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                          {2, static_cast<int>(file.page / 4), 1}, uint32, name),
+                    std::invalid_argument);
+  }
+  CHECK_THROWS_AS(mmap_file_region_named(file.path, file.page, 2 * file.page,
+                                        {2, static_cast<int>(file.page / 4), 1}, float32,
+                                        "backbone.layers.0.mixer.switch_mlp.fc1.tq2_packed"),
+                  std::invalid_argument);
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+
+TEST_CASE("dense named mmap keeps one-expert ownership and layer advice") {
+  NamedMmapFixture file;
+  constexpr int32_t layer = 1900000001;
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  for (const auto* prefix :
+       {"model.layers.1900000001.mlp.",
+        "language_model.model.layers.1900000001.mlp."}) {
+    for (const auto* role : {"gate_proj", "up_proj", "down_proj"}) {
+      for (bool packed : {true, false}) {
+        const Shape shape = packed
+            ? Shape{1, static_cast<int>(file.page / 4), 1}
+            : Shape{1, static_cast<int>(file.page / 2)};
+        const auto name = std::string(prefix) + role + ".tq2_" +
+            (packed ? "packed" : "scales");
+        if (!metal::is_available()) {
+          CHECK_THROWS_WITH_AS(
+              mmap_file_region_named(
+                  file.path,
+                  file.page,
+                  file.page,
+                  shape,
+                  packed ? uint32 : float16,
+                  name),
+              ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+              std::runtime_error);
+          CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+          continue;
+        }
+        {
+          auto bank = mmap_file_region_named(
+              file.path,
+              file.page,
+              file.page,
+              shape,
+              packed ? uint32 : float16,
+              name);
+          CHECK_EQ(bank.shape(), shape);
+          CHECK_EQ(
+              safetensors_mmap_tracked_buffer_bytes(), baseline + file.page);
+          CHECK_EQ(safetensors_mmap_advise_layer(1, layer), file.page);
+          int32_t selected_layer = layer;
+          int32_t expert = 0;
+          CHECK_EQ(
+              safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1),
+              file.page);
+          expert = 1;
+          CHECK_EQ(
+              safetensors_mmap_advise_experts(1, &selected_layer, &expert, 1),
+              0);
+        }
+        CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+        CHECK_EQ(safetensors_mmap_advise_layer(1, layer), 0);
+      }
+    }
+  }
+  const Shape one{1, static_cast<int>(file.page / 4), 1};
+  for (const auto& name :
+       {"language_model.layers.0.mlp.gate_proj.tq2_packed",
+        "vision_model.model.layers.0.mlp.up_proj.tq2_packed",
+        "model.layers.0.mlp.experts.down_proj.tq2_packed",
+        "model.layers.0.mlp.other_proj.tq2_packed",
+        "model.layers.0.mlp.gate_proj.tq2_weight",
+        "language_model.model.layers.00.mlp.gate_proj.tq2_packed",
+        "language_model.model.layers.2147483648.mlp.up_proj.tq2_packed",
+        "model.layers.00.mlp.down_proj.tq2_packed",
+        "model.layers.2147483648.mlp.down_proj.tq2_packed"}) {
+    CHECK_THROWS_AS(
+        mmap_file_region_named(file.path, 0, file.page, one, uint32, name),
+        std::invalid_argument);
+  }
+  for (const auto* prefix :
+       {"model.layers.0.mlp.", "language_model.model.layers.0.mlp."}) {
+    for (const auto* role : {"gate_proj", "up_proj", "down_proj"}) {
+      CHECK_THROWS_AS(
+          mmap_file_region_named(
+              file.path,
+              0,
+              2 * file.page,
+              {2, static_cast<int>(file.page / 4), 1},
+              uint32,
+              std::string(prefix) + role + ".tq2_packed"),
+          std::invalid_argument);
+    }
+  }
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+
+TEST_CASE("named mmap rejects invalid contract before registering") {
+  NamedMmapFixture file;
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  const std::string name =
+      "model.layers.1900000000.mlp.switch_mlp.up_proj.tq2_packed";
+  const Shape valid{2, static_cast<int>(file.page / 4), 1};
+  for (
+      const std::string& invalid :
+      {std::string(""),
+       std::string("model.layers.0.mlp.gate.weight"),
+       std::string("model.layers.00.mlp.switch_mlp.up_proj.tq2_packed"),
+       std::string("model.layers.2147483648.mlp.switch_mlp.up_proj.tq2_packed"),
+       std::string(
+           "model.layers.99999999999999999999999.mlp.switch_mlp.up_proj.tq2_packed")}) {
+    CHECK_THROWS(mmap_file_region_named(
+        file.path, 0, 2 * file.page, valid, uint32, invalid));
+  }
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 0, 2 * file.page, valid, float16, name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 0, 2 * file.page, {2, 1}, uint32, name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 0, 2 * file.page, {0, 1, 1}, uint32, name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 0, 2 * file.page, {-1, 1, 1}, uint32, name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path,
+      0,
+      2 * file.page,
+      {2147483647, 2147483647, 2147483647},
+      uint32,
+      name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 3 * file.page, 2 * file.page, valid, uint32, name));
+  CHECK_THROWS(
+      mmap_file_region_named(file.path, 1, 2 * file.page, valid, uint32, name));
+  CHECK_THROWS(mmap_file_region_named(
+      file.path, 0, 2 * file.page - 1, valid, uint32, name));
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+
+TEST_CASE("unnamed mmap regions retain their unregistered behavior") {
+  NamedMmapFixture file;
+  const auto baseline = safetensors_mmap_tracked_buffer_bytes();
+  if (!metal::is_available()) {
+    CHECK_THROWS_WITH_AS(
+        mmap_file_region(
+            file.path,
+            file.page,
+            file.page,
+            {static_cast<int>(file.page / 4)},
+            uint32),
+        ("[mmap_file_region] make_buffer failed: " + file.path).c_str(),
+        std::runtime_error);
+    CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+    return;
+  }
+  auto bank = mmap_file_region(
+      file.path,
+      file.page,
+      file.page,
+      {static_cast<int>(file.page / 4)},
+      uint32);
+  CHECK_EQ(bank.nbytes(), file.page);
+  CHECK_EQ(safetensors_mmap_tracked_buffer_bytes(), baseline);
+}
+#endif

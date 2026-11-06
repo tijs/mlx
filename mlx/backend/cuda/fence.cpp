@@ -5,26 +5,43 @@
 #include "mlx/backend/cuda/device.h"
 #include "mlx/backend/cuda/event.h"
 
+#include <vector>
+
 namespace mlx::core {
 
 struct FenceImpl {
   uint32_t count;
-  Event event;
+  std::vector<Event> gpu_events;
+  Event cpu_event;
 
-  FenceImpl(uint32_t count, Stream s) : count(count), event(s) {}
+  FenceImpl(uint32_t count, Stream s) : count(count), cpu_event(s) {
+    // Ensure that we use AtomicEvent, it is the only event that can order a CPU
+    // stream against the GPU.
+    cpu_event.cast<cu::EventImpl>().ensure_created(s, 2);
+  }
 };
 
 Fence::Fence(Stream s) {
   fence_ = std::make_shared<FenceImpl>(0, s);
-  // Ensure that we use AtomicEvent.
-  cast<FenceImpl>().event.cast<cu::EventImpl>().ensure_created(s, 2);
 }
 
-void Fence::wait(Stream s, const array&) {
-  cast<FenceImpl>().event.wait();
+void Fence::wait(Stream s, const array&, uint32_t value) {
+  auto& f = cast<FenceImpl>();
+  if (value == 0) {
+    return;
+  }
+  if (!f.gpu_events.empty() && s.device == Device::gpu) {
+    f.gpu_events.at(value - 1).wait(s);
+  } else {
+    // AtomicEvent can not reliably notify a GPU stream, so a dependency that
+    // involves the CPU keeps the synchronous wait.
+    auto& event = f.cpu_event;
+    event.set_value(value);
+    event.wait();
+  }
 }
 
-void Fence::update(Stream s, const array& a, bool cross_device) {
+uint32_t Fence::update(Stream s, const array& a, bool cross_device) {
   auto& f = cast<FenceImpl>();
   if (cross_device) {
     // Move to managed memory if there is a device switch
@@ -37,8 +54,15 @@ void Fence::update(Stream s, const array& a, bool cross_device) {
     }
   }
   f.count++;
-  f.event.set_value(f.count);
-  f.event.signal(s);
+  if (s.device == Device::gpu) {
+    // Keep each recording so a consumer can wait for an earlier update.
+    auto& event = f.gpu_events.emplace_back(s);
+    event.set_value(1);
+    event.signal(s);
+  }
+  f.cpu_event.set_value(f.count);
+  f.cpu_event.signal(s);
+  return f.count;
 }
 
 } // namespace mlx::core

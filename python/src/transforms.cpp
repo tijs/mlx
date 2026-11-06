@@ -334,7 +334,7 @@ auto py_vmap(
                   msg << "[vmap] Invalid" << (output_axes ? " output " : " ")
                       << "vectorization axis " << axis
                       << " for array with shape " << x.shape();
-                  throw std::invalid_argument(msg.str());
+                  throw std::out_of_range(msg.str());
                 }
                 flat_axes.push_back(axis);
               } else if (nb::isinstance<nb::tuple>(inputs[1])) {
@@ -351,7 +351,7 @@ auto py_vmap(
                     msg << "[vmap] Invalid" << (output_axes ? " output " : " ")
                         << "vectorization axis " << axis
                         << " for array with shape " << x.shape();
-                    throw std::invalid_argument(msg.str());
+                    throw std::out_of_range(msg.str());
                   }
                   flat_axes.push_back(axis);
                 } else if (l.size() == 1 && l[0].is_none()) {
@@ -814,8 +814,8 @@ class PyCustomFunction {
       }
       int array_index = 0;
       int tangent_index = 0;
-      auto new_tangents =
-          nb::cast<nb::tuple>(tree_map(args, [&](nb::handle element) {
+      auto new_tangents = nb::cast<nb::tuple>(
+          tree_map(args, [&](nb::handle element) -> nb::object {
             if (nb::isinstance<mx::array>(element) &&
                 have_tangents[array_index++]) {
               return nb::cast(tangents[tangent_index++]);
@@ -861,8 +861,8 @@ class PyCustomFunction {
       }
 
       int arr_index = 0;
-      auto new_axes =
-          nb::cast<nb::tuple>(tree_map(args, [&](nb::handle element) {
+      auto new_axes = nb::cast<nb::tuple>(
+          tree_map(args, [&](nb::handle element) -> nb::object {
             int axis = axes[arr_index++];
             if (nb::isinstance<mx::array>(element) && axis >= 0) {
               return nb::cast(axis);
