@@ -665,6 +665,11 @@ Device::Device() : device_(load_device()), residency_sets_(device_.get()) {
       max_mb_per_buffer_ = 40;
       break;
   }
+  // Keep useful batches after switching input accounting to storage bytes.
+  if (arch_gen_ == 13 && arch == 's' &&
+      device_->recommendedMaxWorkingSetSize() >= (size_t{24} << 30)) {
+    max_mb_per_buffer_ = 200;
+  }
   max_ops_per_buffer_ = env::max_ops_per_buffer(max_ops_per_buffer_);
   max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
 }
