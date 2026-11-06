@@ -1,11 +1,42 @@
 #include "doctest/doctest.h"
 
+#include <cstdlib>
 #include <tuple>
+#include <vector>
 
 #include "mlx/backend/metal/device.h"
 #include "mlx/mlx.h"
 
 using namespace mlx::core;
+
+TEST_CASE("test Metal command buffer batches medium inputs on roomy g13s") {
+  const auto stream = new_stream(Device::gpu);
+  auto& device = metal::device(stream.device);
+  if (device.get_architecture() != "applegpu_g13s" ||
+      device.mtl_device()->recommendedMaxWorkingSetSize() < (size_t{24} << 30) ||
+      std::getenv("MLX_MAX_MB_PER_BUFFER") != nullptr) {
+    MESSAGE("Requires a roomy g13s device with the default command budget");
+    return;
+  }
+
+  auto& encoder = metal::get_command_encoder(stream);
+  constexpr size_t count = size_t{16} << 20;
+  std::vector<array> inputs;
+  for (int i = 0; i < 4; ++i) {
+    auto input = arange(static_cast<double>(count), float32, stream);
+    eval(input);
+    synchronize(stream);
+    inputs.push_back(std::move(input));
+  }
+  CHECK_FALSE(encoder.needs_commit());
+  for (int i = 0; i < 3; ++i) {
+    encoder.set_input_array(inputs[i], i);
+    CHECK_FALSE(encoder.needs_commit());
+  }
+  encoder.set_input_array(inputs[3], 3);
+  CHECK(encoder.needs_commit());
+  encoder.synchronize();
+}
 
 TEST_CASE("test Metal command buffer budget uses storage bytes") {
   const auto stream = new_stream(Device::gpu);
