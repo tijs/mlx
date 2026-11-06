@@ -61,6 +61,7 @@ template <typename T, int D, int V = D>
   const int q_batch_head_idx = tid.x;
   const int q_seq_idx = tid.y;
   const int kv_head_idx = q_batch_head_idx / gqa_factor;
+  const int kv_seq_idx = simd_gid;
   const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
   const int q_offset =
       query_transposed ? tpg.x * q_seq_idx + q_batch_head_idx : o_offset;
@@ -71,11 +72,11 @@ template <typename T, int D, int V = D>
       simd_lid * v_per_thread;
   if (bool_mask) {
     bmask += q_batch_head_idx * mask_head_stride +
-        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        kv_seq_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
   if (float_mask) {
     fmask += q_batch_head_idx * mask_head_stride +
-        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+        kv_seq_idx * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
   }
 
   out += o_offset * V + simd_gid * v_per_thread;
@@ -381,8 +382,8 @@ template <typename T, int D, int V = D, int TK = 4>
     if (use_key) {
       // Compute the i-th score
       U score = 0;
-      for (int i = 0; i < qk_per_thread; i++) {
-        score += q[i] * keys[i];
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * keys[j];
       }
       score = simd_sum(score);
 
@@ -399,19 +400,19 @@ template <typename T, int D, int V = D, int TK = 4>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      for (int i = 0; i < v_per_thread; i++) {
-        o[i] = o[i] * factor + exp_score * values[i];
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * values[j];
       }
     }
 
     // Move the pointers to the next kv
-    keys += blocks * int(k_seq_stride);
-    values += blocks * int(v_seq_stride);
+    keys += stride_k_tok;
+    values += stride_v_tok;
     if (bool_mask) {
-      bmask += blocks * mask_kv_seq_stride;
+      bmask += stride_mask_tok;
     }
     if (float_mask) {
-      fmask += blocks * mask_kv_seq_stride;
+      fmask += stride_mask_tok;
     }
   }
 

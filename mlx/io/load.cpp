@@ -1,5 +1,6 @@
 // Copyright © 2023-2026 Apple Inc.
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -291,10 +292,23 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   size_t ed = header.find_last_of(')');
   std::string shape_str = header.substr(st, ed - st);
 
+  size_t max_size = std::numeric_limits<size_t>::max() / size_of(dtype);
+  size_t total_size = 1;
   while (!shape_str.empty()) {
     // Read current number and get position of comma
     size_t pos;
     int dim = std::stoi(shape_str, &pos);
+
+    // Reject negative dims and a total byte count that overflows size_t
+    if (dim < 0) {
+      throw std::runtime_error(
+          "[load] Negative dimension in shape in " + in_stream->label());
+    }
+    if (dim != 0 && total_size > max_size / dim) {
+      throw std::runtime_error(
+          "[load] Shape is too large in " + in_stream->label());
+    }
+    total_size *= dim;
     shape.push_back(dim);
 
     // Skip the comma and space and read the next number
@@ -387,7 +401,15 @@ ThreadPool& ParallelFileReader::thread_pool() {
 void ParallelFileReader::read(char* data, size_t n) {
   while (n != 0) {
     auto m = ::read(fd_, data, std::min(n, static_cast<size_t>(INT32_MAX)));
-    if (m <= 0) {
+    if (m < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      std::ostringstream msg;
+      msg << "[read] Unable to read " << n << " bytes from file.";
+      throw std::runtime_error(msg.str());
+    }
+    if (m == 0) {
       std::ostringstream msg;
       msg << "[read] Unable to read " << n << " bytes from file.";
       throw std::runtime_error(msg.str());
@@ -401,11 +423,18 @@ void ParallelFileReader::read(char* data, size_t n, size_t offset) {
   auto readfn = [fd = fd_](size_t offset, size_t size, char* buffer) -> bool {
     while (size != 0) {
       auto m = pread(fd, buffer, size, offset);
-      if (m <= 0) {
+      if (m < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      if (m == 0) {
         return false;
       }
       buffer += m;
       size -= m;
+      offset += m;
     }
     return true;
   };

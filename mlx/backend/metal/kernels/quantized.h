@@ -36,16 +36,22 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   if (bits == 1) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      for (int j = 0; j < 8; j++) {
-        sum += x[i + j];
-        x_thread[i + j] = x[i + j] / static_cast<U>(1 << j);
-      }
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
+      x_thread[i + 4] = x[i + 4];
+      x_thread[i + 5] = x[i + 5];
+      x_thread[i + 6] = x[i + 6];
+      x_thread[i + 7] = x[i + 7];
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 4.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -55,8 +61,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 3) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
       x_thread[i + 2] = x[i + 2] / 64.0f;
@@ -70,7 +76,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -80,8 +86,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 5) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -95,7 +101,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 
   else if (bits == 6) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -124,16 +130,22 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   if (bits == 1) {
     for (int i = 0; i < N; i += 8) {
-      for (int j = 0; j < min(8, N - i); j++) {
-        sum += x[i + j];
-        x_thread[i + j] = x[i + j] / static_cast<U>(1 << j);
-      }
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
+      x_thread[i + 4] = x[i + 4];
+      x_thread[i + 5] = x[i + 5];
+      x_thread[i + 6] = x[i + 6];
+      x_thread[i + 7] = x[i + 7];
     }
   }
 
   else if (bits == 2) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 4.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -143,8 +155,8 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 3) {
     for (int i = 0; i < N; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
 
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
@@ -159,7 +171,7 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 4) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -169,8 +181,8 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 5) {
     for (int i = 0; i < N; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]) + U(x[i + 4]) +
+          U(x[i + 5]) + U(x[i + 6]) + U(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -184,7 +196,7 @@ inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
 
   else if (bits == 6) {
     for (int i = 0; i < N; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -222,9 +234,15 @@ inline U qdot(
 
   if (bits == 1) {
     for (int i = 0; i < (values_per_thread / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        accum += x_thread[8 * i + j] * (w[i] & (1 << j));
-      }
+      uint8_t wb = w[i];
+      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
+      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
+      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
+      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
+      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
+      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
+      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
+      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
     }
   }
 
@@ -331,10 +349,16 @@ inline U qdot_safe(
   U accum = 0;
 
   if (bits == 1) {
-    for (int i = 0; i < N; i += 8) {
-      for (int j = 0; j < min(8, N - i); j++) {
-        accum += x_thread[i + j] * (w[i / 8] & (1 << j));
-      }
+    for (int i = 0; i < (N / 8); i++) {
+      uint8_t wb = w[i];
+      accum += select(U(0), x_thread[8 * i], bool(wb & 0x01));
+      accum += select(U(0), x_thread[8 * i + 1], bool(wb & 0x02));
+      accum += select(U(0), x_thread[8 * i + 2], bool(wb & 0x04));
+      accum += select(U(0), x_thread[8 * i + 3], bool(wb & 0x08));
+      accum += select(U(0), x_thread[8 * i + 4], bool(wb & 0x10));
+      accum += select(U(0), x_thread[8 * i + 5], bool(wb & 0x20));
+      accum += select(U(0), x_thread[8 * i + 6], bool(wb & 0x40));
+      accum += select(U(0), x_thread[8 * i + 7], bool(wb & 0x80));
     }
   }
 
@@ -435,9 +459,15 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
 
   if (bits == 1) {
     for (int i = 0; i < (values_per_thread / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        result[8 * i + j] += x * (((w[i] >> j) & 1) * scale + bias);
-      }
+      uint8_t wb = w[i];
+      result[8 * i] += x * (select(U(0), scale, bool(wb & 0x01)) + bias);
+      result[8 * i + 1] += x * (select(U(0), scale, bool(wb & 0x02)) + bias);
+      result[8 * i + 2] += x * (select(U(0), scale, bool(wb & 0x04)) + bias);
+      result[8 * i + 3] += x * (select(U(0), scale, bool(wb & 0x08)) + bias);
+      result[8 * i + 4] += x * (select(U(0), scale, bool(wb & 0x10)) + bias);
+      result[8 * i + 5] += x * (select(U(0), scale, bool(wb & 0x20)) + bias);
+      result[8 * i + 6] += x * (select(U(0), scale, bool(wb & 0x40)) + bias);
+      result[8 * i + 7] += x * (select(U(0), scale, bool(wb & 0x80)) + bias);
     }
   }
 
@@ -535,12 +565,28 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   const float b = float(bias);
 
   if (bits == 1) {
+    float sc[8] = {
+        s,
+        s / 2.0f,
+        s / 4.0f,
+        s / 8.0f,
+        s / 16.0f,
+        s / 32.0f,
+        s / 64.0f,
+        s / 128.0f};
     for (int i = 0; i < (N / 8); i++) {
-      for (int j = 0; j < 8; j++) {
-        w_local[8 * i + j] = static_cast<U>(((w[i] >> j) & 1) * s + b);
-      }
+      w_local[8 * i] = static_cast<U>(sc[0] * (w[i] & 0x01) + b);
+      w_local[8 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0x02) + b);
+      w_local[8 * i + 2] = static_cast<U>(sc[2] * (w[i] & 0x04) + b);
+      w_local[8 * i + 3] = static_cast<U>(sc[3] * (w[i] & 0x08) + b);
+      w_local[8 * i + 4] = static_cast<U>(sc[4] * (w[i] & 0x10) + b);
+      w_local[8 * i + 5] = static_cast<U>(sc[5] * (w[i] & 0x20) + b);
+      w_local[8 * i + 6] = static_cast<U>(sc[6] * (w[i] & 0x40) + b);
+      w_local[8 * i + 7] = static_cast<U>(sc[7] * (w[i] & 0x80) + b);
     }
-  } else if (bits == 2) {
+  }
+
+  else if (bits == 2) {
     float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
     for (int i = 0; i < (N / 4); i++) {
       w_local[4 * i] = static_cast<U>(sc[0] * (w[i] & 0x03) + b);
@@ -801,7 +847,7 @@ METAL_FUNC void qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits, typename S = T, typename O = T>
+template <typename T, int group_size, int bits, typename S = T, typename O = T, bool partial_rows = false>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device S* scales,
@@ -813,7 +859,8 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int packs_per_thread = (bits == 1 || bits == 2) ? 1 : 2;
+  constexpr int packs_per_thread =
+      bits <= 2 ? 1 : 2; // 1-bit: 1 pack (vpt=32) for occupancy
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
@@ -835,13 +882,26 @@ METAL_FUNC void qmv_fast_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
+  // With partial rows the output size need not be a multiple of 8. Rows of the
+  // last SIMD-group that fall past the output reuse the weights of the last
+  // valid output row, so the reduction loop needs no per-row bounds check, and
+  // are not stored.
+  int last_row = results_per_simdgroup - 1;
+  if constexpr (partial_rows) {
+    if (out_row >= out_vec_size) {
+      return;
+    }
+    last_row = min(last_row, out_vec_size - 1 - out_row);
+  }
+
   ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
-  for (int k = 0; k < in_vec_size; k += block_size) {
+  const int aligned_end = (in_vec_size / block_size) * block_size;
+  for (int k = 0; k < aligned_end; k += block_size) {
     U sum;
     if constexpr (
         bits == 6 && metal::is_same_v<T, bfloat16_t> &&
@@ -881,9 +941,10 @@ METAL_FUNC void qmv_fast_impl(
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device S* sl = scales + row * in_vec_size_g;
-      const device S* bl = biases + row * in_vec_size_g;
+      int src = partial_rows ? min(row, last_row) : row;
+      auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+      const device S* sl = scales + src * in_vec_size_g;
+      const device S* bl = biases + src * in_vec_size_g;
 
       U s = sl[0];
       U b = bl[0];
@@ -896,9 +957,37 @@ METAL_FUNC void qmv_fast_impl(
     x += block_size;
   }
 
+  // Tail block: handles K that is a multiple of 512 (dispatch gate) but not
+  // of block_size. Only 1-bit has block_size > 512 (it uses 2048), so for
+  // >=2-bit this is a no-op. Out-of-bounds lanes skip the qdot call entirely;
+  // their result[row] stays at 0 and contributes 0 to the simd_sum below.
+  if (aligned_end < in_vec_size) {
+    bool in_bounds =
+        (aligned_end + static_cast<int>(simd_lid) * values_per_thread) <
+        in_vec_size;
+    if (in_bounds) {
+      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        int src = row;
+        if constexpr (partial_rows) {
+          src = min(row, last_row);
+        }
+        auto wl = (const device uint8_t*)(ws + src * in_vec_size_w);
+        const device S* sl = scales + src * in_vec_size_g;
+        const device S* bl = biases + src * in_vec_size_g;
+
+        U s = sl[0];
+        U b = bl[0];
+        result[row] +=
+            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
+    }
+  }
+
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && row <= last_row) {
       y[row] = static_cast<O>(result[row]);
     }
   }
@@ -1372,6 +1461,7 @@ template <
     const int group_size,
     const int bits,
     const bool aligned_N,
+    typename U = T,
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
@@ -1380,7 +1470,7 @@ METAL_FUNC void qmm_t_impl(
     const device T* scales,
     const device T* biases,
     const device T* x,
-    device T* y,
+    device U* y,
     threadgroup T* Xs,
     threadgroup T* Ws,
     const constant int& K,
@@ -1405,7 +1495,7 @@ METAL_FUNC void qmm_t_impl(
 
   // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
+      BlockMMA<T, U, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
@@ -1781,6 +1871,7 @@ template <
     int group_size,
     int bits,
     bool batched,
+    bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void affine_qmv_fast(
@@ -1821,7 +1912,7 @@ template <
         b_strides,
         tid);
   }
-  qmv_fast_impl<T, group_size, bits>(
+  qmv_fast_impl<T, group_size, bits, T, T, partial_rows>(
       w,
       scales,
       biases,
@@ -1998,6 +2089,7 @@ template <
     int group_size,
     const int bits,
     bool batched,
+    bool partial_rows = false,
     bool has_global_scale = false,
     int results_per_simdgroup = 4>
 [[kernel]] void affine_qmv(
@@ -2284,7 +2376,7 @@ template <
         b_strides,
         tid);
   }
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN>(
       w,
       scales,
       biases,
@@ -2315,7 +2407,7 @@ template <
     const device T* scales [[buffer(1)]],
     const device T* biases [[buffer(2)]],
     const device T* x [[buffer(3)]],
-    device T* y [[buffer(4)]],
+    device float* y [[buffer(4)]],
     const constant int& K [[buffer(5)]],
     const constant int& N [[buffer(6)]],
     const constant int& M [[buffer(7)]],
@@ -2343,7 +2435,7 @@ template <
   biases += k_start / group_size;
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, float, BM, BK, BN>(
       (const device uint32_t*)wl,
       scales,
       biases,
@@ -2737,7 +2829,7 @@ template <
       s_strides,
       b_strides,
       tid);
-  qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  qmm_t_impl<T, group_size, bits, aligned_N, T, BM, BK, BN>(
       w,
       scales,
       biases,

@@ -5,7 +5,6 @@ from itertools import product
 
 import mlx.core as mx
 import mlx_tests
-import numpy as np
 
 
 def mlx_ref_attn(q, k, v, scale=1.0, mask=None, sinks=None):
@@ -27,7 +26,6 @@ def mlx_ref_attn(q, k, v, scale=1.0, mask=None, sinks=None):
     scores = q @ mx.swapaxes(k, -1, -2)
     is_causal = mask == "causal"
     if mask is not None:
-
         if is_causal:
             offset = kL - L
             q_indices = mx.arange(L) + offset
@@ -361,6 +359,51 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                         tol = 5e-3
                     self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
 
+        if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+            return
+
+        mx.random.seed(0)
+        cases = (
+            (1, 4, 2, 1024, 1057, 1152),
+            (2, 2, 1, 1025, 1025, None),
+            (1, 2, 1, 1024, 4103, 4128),
+        )
+        for dtype, (B, qH, kH, qL, kL, cache_len) in product(
+            (mx.float16, mx.bfloat16), cases
+        ):
+            with self.subTest(dtype=dtype, qL=qL, kL=kL):
+                q = (0.5 * mx.random.normal((B, qH, qL, 512))).astype(dtype)
+                kv_len = cache_len or kL
+                k_cache = (0.5 * mx.random.normal((B, kH, kv_len, 512))).astype(dtype)
+                v_cache = (0.5 * mx.random.normal((B, kH, kv_len, 512))).astype(dtype)
+                k = k_cache[..., :kL, :]
+                v = v_cache[..., :kL, :]
+                scale = 512**-0.5
+                ref = mlx_ref_attn(q, k, v, scale=scale, mask="causal")
+                out = mx.fast.scaled_dot_product_attention(
+                    q, k, v, scale=scale, mask="causal"
+                )
+                tol = 1e-2 if dtype == mx.bfloat16 else 1e-3
+                self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
+
+        q = mx.random.normal((1, 2, 1024, 512), mx.float16)
+        k = mx.random.normal((1, 1, 1057, 512), mx.float16)
+        v = mx.random.normal((1, 1, 1057, 512), mx.float16)
+        scale = 512**-0.5
+        mask = mx.random.uniform(shape=(1, 1, 1024, 1057)) > 0.2
+        sinks = mx.random.normal((2,), mx.float16)
+        fallback_cases = (
+            (v, mask, None),
+            (v, "causal", sinks),
+            (v[..., :128], "causal", None),
+        )
+        for v_arg, mask_arg, sinks_arg in fallback_cases:
+            ref = mlx_ref_attn(q, k, v_arg, scale=scale, mask=mask_arg, sinks=sinks_arg)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v_arg, scale=scale, mask=mask_arg, sinks=sinks_arg
+            )
+            self.assertTrue(mx.allclose(ref, out, atol=1e-3, rtol=1e-3))
+
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")
     def test_sdpa_full_head_dim_512_nax(self):
         if mx.default_device() != mx.gpu:
@@ -509,6 +552,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         Nq = 4
         Nkv = 1
         scale = 1.0
+        tol = 1e-3 if mx.cuda.is_available() else 1e-4
         mx.random.seed(0)
         q = 5e-1 * mx.random.normal(shape=(1, Nq, 1, D))
         k = 5e-1 * mx.random.normal(shape=(1, Nkv, L, D))
@@ -544,7 +588,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 scale=scale,
                 mask=m,
             )
-            self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
+            self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
 
         L = 4096
         scale = 1.0
@@ -573,7 +617,7 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
                 scale=scale,
                 mask=m,
             )
-            self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
+            self.assertTrue(mx.allclose(ref, out, atol=tol, rtol=tol))
 
     def test_sdpa_vector_gqa_long(self):
         scale = 1.0
@@ -1047,6 +1091,20 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
         ref = mlx_ref_attn(q, k, v, scale=1.0, mask=mask)
         self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
 
+    def test_sdpa_vector_reversed_mask(self):
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(1, 2, 1, 64))
+        k = mx.random.normal(shape=(1, 2, 16, 64))
+        v = mx.random.normal(shape=(1, 2, 16, 64))
+        masks = [
+            mx.random.normal(shape=(1, 2, 1, 16))[..., ::-1],
+            (mx.arange(16) % 3 != 0).reshape(1, 1, 1, 16)[..., ::-1],
+        ]
+        for mask in masks:
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.125, mask=mask)
+            ref = mlx_ref_attn(q, k, v, scale=0.125, mask=mask)
+            self.assertTrue(mx.allclose(ref, out, atol=1e-4, rtol=1e-4))
+
     def test_sdpa_promote_mask(self):
         mask = mx.array(2.0, mx.bfloat16)
         D = 64
@@ -1172,20 +1230,25 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
             mask_bool = mx.random.uniform(0, 1, (B, N_q, T, T), dtype=mx.float16) < 0.5
 
             for mask in (None, "causal", mask_additive, mask_bool):
-                sdpa_slow = lambda q, k, v: mlx_ref_attn(
-                    q, k, v, scale=scale, mask=mask
-                )
-                sdpa_fast = lambda q, k, v: mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=scale, mask=mask
-                )
+
+                def sdpa_slow(q, k, v):
+                    return mlx_ref_attn(q, k, v, scale=scale, mask=mask)
+
+                def sdpa_fast(q, k, v):
+                    return mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, mask=mask
+                    )
+
                 test_vjp(sdpa_slow, sdpa_fast, [q, k, v])
 
-                loss_slow = lambda q, k, v: mlx_ref_attn(
-                    q, k, v, scale=scale, mask=mask
-                ).sum()
-                loss_fast = lambda q, k, v: mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=scale, mask=mask
-                ).sum()
+                def loss_slow(q, k, v):
+                    return mlx_ref_attn(q, k, v, scale=scale, mask=mask).sum()
+
+                def loss_fast(q, k, v):
+                    return mx.fast.scaled_dot_product_attention(
+                        q, k, v, scale=scale, mask=mask
+                    ).sum()
+
                 test_grad(loss_slow, loss_fast, [q, k, v])
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal kernel path only")

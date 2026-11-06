@@ -9,6 +9,7 @@
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/mlx.h"
+#include "mlx/primitives.h"
 
 using namespace mlx::core;
 
@@ -124,8 +125,9 @@ TEST_CASE("test reshape") {
   CHECK(x.flags().col_contiguous);
   y = reshape(x, {2, 5, 10});
   eval(y);
+  // Strides (5, 1, 10) are neither row nor col major
   CHECK(!y.flags().row_contiguous);
-  CHECK(y.flags().col_contiguous);
+  CHECK(!y.flags().col_contiguous);
   y = reshape(x, {2, 50});
   eval(y);
   CHECK(y.flags().row_contiguous);
@@ -358,6 +360,22 @@ TEST_CASE("test slice") {
   out = slice(x, {3, 0}, {-5, 2}, {-1, 1});
   eval(out);
   CHECK_EQ(out.data_size(), 8);
+
+  x = as_strided(square(arange(16, float32)), {3, 2, 2}, {1, 1, 5}, 0);
+  out = slice(x, {0, 0, 0}, {2, 2, 2});
+  eval(out);
+  CHECK_EQ(out.data_size(), 8);
+  CHECK_FALSE(out.flags().contiguous);
+  CHECK_EQ(sum(out).item<float>(), 152.0f);
+
+  x = reshape(arange(6), {2, 3});
+  x = slice(x, {1, 0}, {-3, 3}, {-1, 1});
+  out = slice(x, {1, 0}, {-3, 3}, {-1, 1});
+  eval(out);
+  CHECK(out.flags().contiguous);
+  CHECK(out.flags().row_contiguous);
+  CHECK(array_equal(reshape(transpose(out), {-1}), array({0, 3, 1, 4, 2, 5}))
+            .item<bool>());
 }
 
 TEST_CASE("test slice update") {
@@ -606,6 +624,71 @@ TEST_CASE("test split") {
   CHECK(array_equal(out[1], array({})).item<bool>());
   CHECK(array_equal(out[2], array({1})).item<bool>());
   CHECK(array_equal(out[3], array({2, 3, 4})).item<bool>());
+
+  // data_size is the distance between the first and the last element, so a
+  // split that leaves holes reports more than the output has elements.
+  x = ones({4, 4});
+  out = split(x, 2, 1);
+  eval(out);
+  CHECK_EQ(out[0].data_size(), 14);
+  CHECK_EQ(out[1].data_size(), 14);
+
+  // Splitting the first axis leaves no holes.
+  out = split(x, 2, 0);
+  eval(out);
+  CHECK_EQ(out[0].data_size(), 8);
+  CHECK_EQ(out[1].data_size(), 8);
+
+  x = ones({2, 3, 4});
+  out = split(x, Shape{2}, 2);
+  eval(out);
+  CHECK_EQ(out[0].data_size(), 22);
+  CHECK_EQ(out[1].data_size(), 22);
+
+  // A split output and the matching slice are the same view.
+  x = ones({1, 2, 8, 12});
+  out = split(x, Shape{8}, 3);
+  auto sliced = slice(x, {0, 0, 0, 8}, {1, 2, 8, 12});
+  eval(out);
+  eval(sliced);
+  CHECK_EQ(out[1].data_size(), sliced.data_size());
+  CHECK_EQ(out[1].data_size(), 184);
+
+  // (4, 4) array, but slice keeps the strides at (8, 1)
+  x = slice(reshape(arange(32), {4, 8}), {0, 0}, {4, 4});
+  // out[0] and out[1] are (4, 2)
+  out = split(x, Shape{2}, 1);
+  // same out out[1]
+  auto holey = slice(x, {0, 2}, {4, 4});
+  eval(out);
+  eval(holey);
+  CHECK_EQ(out[0].data_size(), 26);
+  CHECK_EQ(out[1].data_size(), 26);
+  CHECK_EQ(out[1].data_size(), holey.data_size());
+  CHECK_EQ(out[0].strides(), x.strides());
+  CHECK_EQ(out[1].strides(), holey.strides());
+  CHECK(array_equal(out[1], holey).item<bool>());
+
+  // A negative stride travels backwards, so it bounds the span from below.
+  // strides (-4, 1)
+  x = flip(reshape(arange(24), {6, 4}), 0);
+  out = split(x, Shape{2}, 0);
+  eval(out);
+  // no holes
+  CHECK_EQ(out[0].data_size(), 8);
+  CHECK_EQ(out[1].data_size(), 16);
+  CHECK_EQ(out[0].strides(), x.strides());
+  CHECK_EQ(out[1].strides(), x.strides());
+  CHECK(array_equal(out[0], slice(x, {0, 0}, {2, 4})).item<bool>());
+  CHECK(array_equal(out[1], slice(x, {2, 0}, {6, 4})).item<bool>());
+
+  // A zero-length axis empties every output. Splitting at 0 cannot get here,
+  // split() sends that to slice().
+  x = ones({0, 4});
+  out = split(x, Shape{2}, 1);
+  eval(out);
+  CHECK_EQ(out[0].data_size(), 0);
+  CHECK_EQ(out[1].data_size(), 0);
 }
 
 TEST_CASE("test flip") {
@@ -893,6 +976,29 @@ TEST_CASE("test comparison ops") {
     expected = array({true, false, true, true}, {2, 2});
     z = less_equal(x, y);
     CHECK(array_equal(z, expected).item<bool>());
+  }
+}
+
+TEST_CASE("test float16 sigmoid mixed lanes") {
+  const float values[] = {-12, -4, -1, 0, 1, 4, 12, -2};
+  for (int size : {1, 7, 8, 9, 15, 16, 17}) {
+    for (int offset = 0; offset < 8; ++offset) {
+      std::vector<float> input(size);
+      for (int i = 0; i < size; ++i) {
+        input[i] = values[(i + offset) % 8];
+      }
+      auto result = sigmoid(array(input.begin(), {size}, float16), Device::cpu);
+      result.eval();
+      for (int i = 0; i < size; ++i) {
+        CAPTURE(size);
+        CAPTURE(offset);
+        CAPTURE(i);
+        auto expected = 1.0 / (1.0 + std::exp(-double(input[i])));
+        CHECK_EQ(
+            static_cast<float>(result.data<float16_t>()[i]),
+            doctest::Approx(expected).epsilon(0.002));
+      }
+    }
   }
 }
 
@@ -2006,9 +2112,10 @@ TEST_CASE("test arithmetic binary ops") {
   // Integer division by zero gives quotient 0 and remainder a.
   if (default_device() == Device::cpu) {
     for (auto dt : {int8, int16, int32, int64, uint8, uint16, uint32, uint64}) {
-      auto num = astype(array({7, 0, 5}, {3}), dt);
-      auto den = zeros({3}, dt);
-      CHECK(array_equal(floor_divide(num, den), zeros({3}, dt)).item<bool>());
+      auto num = astype(array({7, 0, 5, -7}, {4}), dt);
+      auto den = zeros({4}, dt);
+      auto q = floor_divide(num, den);
+      CHECK(array_equal(q, zeros({4}, dt)).item<bool>());
       CHECK(array_equal(remainder(num, den), num).item<bool>());
     }
   }
@@ -2893,6 +3000,13 @@ TEST_CASE("test as_strided op") {
   CHECK_EQ(y.data_size(), 10);
   CHECK_FALSE(y.flags().contiguous);
 
+  auto xf = square(arange(16, float32));
+  y = as_strided(xf, {2, 2, 2}, {1, 1, 5}, 0);
+  eval(y);
+  CHECK_EQ(y.data_size(), 8);
+  CHECK_FALSE(y.flags().contiguous);
+  CHECK_EQ(sum(y).item<float>(), 152.0f);
+
   x = reshape(x, {2, 5}); // 0 1 2 3 ...
   x = transpose(x, {1, 0}); // 0 5 1 6 2 7 ...
   y = as_strided(x, {3, 3}, {2, 1}, 1);
@@ -3629,6 +3743,25 @@ TEST_CASE("inner") {
   z = inner(eye(2), array(7.));
   expected = array({7., 0., 0., 7.}, {2, 2});
   CHECK(array_equal(z, expected).item<bool>());
+}
+
+TEST_CASE("test floor divide") {
+  // Signed integers round the quotient towards minus infinity.
+  auto x = array({4, 5, -1, -6});
+  auto y = array({-2, 3, 2, -3});
+  CHECK(array_equal(floor_divide(x, y), array({-2, 1, -1, 2})).item<bool>());
+
+  // Unsigned integers use the plain quotient.
+  auto ux = astype(array({7, 0, 5}, {3}), uint32);
+  auto uy = astype(array({2, 2, 3}, {3}), uint32);
+  auto expected = astype(array({3, 0, 1}, {3}), uint32);
+  CHECK(array_equal(floor_divide(ux, uy), expected).item<bool>());
+
+  // The dtype is kept and the result is one primitive.
+  auto out = floor_divide(astype(x, int8), astype(array(3), int8));
+  CHECK_EQ(out.dtype(), int8);
+  CHECK_EQ(std::string(out.primitive().name()), "FloorDivide");
+  CHECK(out.siblings().empty());
 }
 
 TEST_CASE("test divmod") {

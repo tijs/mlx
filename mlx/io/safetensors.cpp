@@ -699,9 +699,9 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     }
     shard->tracked_buffer_bytes = file_size;
     base_array.emplace(
-        buffer, Shape{1}, uint8, [shard](allocator::Buffer buffer) {
+        allocator::Data(buffer, [shard](allocator::Buffer buffer) {
           allocator::release(buffer);
-        });
+        }), Shape{1}, uint8);
   }
 
   const size_t data_start = static_cast<size_t>(json_header_length) + 8;
@@ -716,7 +716,7 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
                               size_t byte_length) {
     if (byte_offset % size_of(type) == 0) {
       array tensor(
-          allocator::Buffer(nullptr), shape, type, [](allocator::Buffer) {});
+          allocator::Data(allocator::Buffer(nullptr), [](allocator::Buffer) {}), shape, type);
       tensor.copy_shared_buffer(
           byte_base,
           tensor.strides(),
@@ -740,17 +740,17 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
     // same shard remain zero-copy mmap-backed.  This bounds the unavoidable
     // repair to malformed payloads instead of materializing the entire shard.
     auto aligned = allocator::malloc(byte_length);
-    if (aligned.ptr() == nullptr || aligned.raw_ptr() == nullptr) {
+    if (aligned.buffer().ptr() == nullptr || aligned.buffer().raw_ptr() == nullptr) {
       throw std::runtime_error(
           "[safetensor] failed to allocate aligned buffer for unaligned mmap tensor");
     }
     std::memcpy(
-        aligned.raw_ptr(),
+        aligned.buffer().raw_ptr(),
         byte_base.data<uint8_t>() + byte_offset,
         byte_length);
     realigned_tensor_count += 1;
     realigned_tensor_bytes += byte_length;
-    return array(aligned, shape, type);
+    return array(std::move(aligned), shape, type);
   };
   for (const auto& item : metadata.items()) {
     if (item.key() == "__metadata__") {
@@ -814,9 +814,9 @@ std::optional<SafetensorsLoad> load_safetensors_mmap(
       }
       tensor_shard->tracked_buffer_bytes = span;
       array tensor_base(
-          buffer, Shape{1}, uint8, [tensor_shard](allocator::Buffer buffer) {
+          allocator::Data(buffer, [tensor_shard](allocator::Buffer buffer) {
             allocator::release(buffer);
-          });
+          }), Shape{1}, uint8);
       tensor = tensor_from_mmap(
           tensor_base,
           shape,
@@ -1064,12 +1064,11 @@ static array mmap_file_region_impl(
   }
   shard->tracked_buffer_bytes = static_cast<size_t>(span);
   array base(
-      buffer,
+      allocator::Data(buffer, [shard](allocator::Buffer buffer) { allocator::release(buffer); }),
       Shape{static_cast<ShapeElem>(span)},
-      uint8,
-      [shard](allocator::Buffer buffer) { allocator::release(buffer); });
+      uint8);
   array tensor(
-      allocator::Buffer(nullptr), shape, dtype, [](allocator::Buffer) {});
+      allocator::Data(allocator::Buffer(nullptr), [](allocator::Buffer) {}), shape, dtype);
   tensor.copy_shared_buffer(
       base,
       tensor.strides(),
