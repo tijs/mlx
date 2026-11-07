@@ -25,7 +25,7 @@ TEST_CASE("test upstream Metal thin GEMM and quantized row boundaries") {
     const float tolerance = dtype == bfloat16 ? 0.015f : 0.003f;
     auto x = astype(reshape(sin(divide(arange(65 * 2560, float32, Device::cpu), array(31.0f), Device::cpu), Device::cpu), {65, 2560}, Device::cpu), dtype, Device::gpu);
     auto w = astype(reshape(cos(divide(arange(1024 * 2560, float32, Device::cpu), array(17.0f), Device::cpu), Device::cpu), {1024, 2560}, Device::cpu), dtype, Device::gpu);
-    for (int rows : {6, 16, 33, 65}) {
+    for (int rows : {1, 3, 6, 8, 16, 33, 65}) {
       CAPTURE(dtype);
       CAPTURE(rows);
       auto input = slice(x, {0, 0}, {rows, 2560});
@@ -56,8 +56,43 @@ TEST_CASE("test upstream Metal two-pass attention preserves sparse masked keys")
   auto masked_scores = where(mask, zeros({1, 8, 1, length}, float32, Device::cpu), full({1, 8, 1, length}, -INFINITY, float32, Device::cpu), Device::cpu);
   auto repeated_values = repeat(astype(values, float32, Device::cpu), 4, 1, Device::cpu);
   auto expected = matmul(softmax(masked_scores, -1, true, Device::cpu), repeated_values, Device::cpu);
-  auto actual = fast::scaled_dot_product_attention(query, keys, values, 1.0f, "", mask);
+  auto actual = fast::scaled_dot_product_attention(
+      query, keys, values, 1.0f, /*window_size=*/-1, "", mask);
   check_relative_rms(actual, expected, 0.003f);
+}
+
+TEST_CASE("test mixed affine Q6 dispatch preserves the promoted F32 result") {
+  if (!is_available(Device::gpu)) {
+    return;
+  }
+  constexpr int k = 2048, n = 1024, group_size = 64, bits = 6;
+  const auto gpu = Device::gpu;
+  auto x = astype(reshape(sin(arange(k, float32, gpu), gpu), {1, k}, gpu), bfloat16, gpu);
+  auto w = astype(reshape(cos(arange(n * k, float32, gpu), gpu), {n, k}, gpu), float16, gpu);
+  auto q = quantize(w, group_size, bits, "affine", std::nullopt, gpu);
+  auto mixed = quantized_matmul(x, q[0], q[1], q[2], true, group_size, bits, "affine", gpu);
+  auto promoted = quantized_matmul(
+      astype(x, float32, gpu), q[0], astype(q[1], float32, gpu), astype(q[2], float32, gpu),
+      true, group_size, bits, "affine", gpu);
+  REQUIRE(mixed.dtype() == float32);
+  CHECK(array_equal(mixed, promoted, false, gpu).item<bool>());
+}
+
+TEST_CASE("test Metal window intersects a long shared sparse mask") {
+  if (!is_available(Device::gpu)) {
+    return;
+  }
+  constexpr int length = 49152, window = 2048, dim = 64;
+  const auto gpu = Device::gpu;
+  auto positions = arange(length, int32, gpu);
+  auto mask = equal(remainder(positions, array(2), gpu), array(0), gpu);
+  auto values = where(less(positions, array(length - window), gpu), array(16.0f),
+      where(mask, array(2.0f), array(32.0f), gpu), gpu);
+  values = broadcast_to(reshape(values, {1, 1, length, 1}, gpu), {1, 1, length, dim}, gpu);
+  auto q = zeros({1, 8, 1, dim}, float32, gpu);
+  auto k = zeros({1, 1, length, dim}, float32, gpu);
+  auto out = fast::scaled_dot_product_attention(q, k, values, 1.0f, window, "", mask, {}, false, gpu);
+  check_relative_rms(out, full({1, 8, 1, dim}, 2.0f, float32, Device::cpu), 1e-6f);
 }
 
 TEST_CASE("test upstream Metal FP4 half and bfloat fallback numerical parity") {

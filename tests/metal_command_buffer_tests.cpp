@@ -9,6 +9,14 @@
 
 using namespace mlx::core;
 
+namespace {
+int command_buffer_budget_mb(const Stream& stream) {
+  const auto defaults =
+      metal::device(stream.device).get_default_max_ops_mb_per_buffer();
+  return env::max_mb_per_buffer(std::get<1>(defaults));
+}
+} // namespace
+
 TEST_CASE("test Metal command buffer batches medium inputs on roomy g13s") {
   const auto stream = new_stream(Device::gpu);
   auto& device = metal::device(stream.device);
@@ -41,8 +49,7 @@ TEST_CASE("test Metal command buffer batches medium inputs on roomy g13s") {
 TEST_CASE("test Metal command buffer budget uses storage bytes") {
   const auto stream = new_stream(Device::gpu);
   auto& encoder = metal::get_command_encoder(stream);
-  const auto max_mb =
-      std::get<1>(metal::device(stream.device).get_max_ops_mb_per_buffer());
+  const auto max_mb = command_buffer_budget_mb(stream);
   CAPTURE(max_mb);
   REQUIRE(max_mb >= 0);
   REQUIRE(max_mb <= 256);
@@ -65,8 +72,7 @@ TEST_CASE("test Metal command buffer budget uses storage bytes") {
 TEST_CASE("test Metal command buffer budget counts broadcast storage once") {
   const auto stream = new_stream(Device::gpu);
   auto& encoder = metal::get_command_encoder(stream);
-  const auto max_mb =
-      std::get<1>(metal::device(stream.device).get_max_ops_mb_per_buffer());
+  const auto max_mb = command_buffer_budget_mb(stream);
   REQUIRE(max_mb >= 1);
   REQUIRE(max_mb <= 256);
   const auto count = ((max_mb + 1) << 20) / sizeof(float) + 1;
@@ -84,8 +90,7 @@ TEST_CASE("test Metal command buffer budget counts broadcast storage once") {
 TEST_CASE("test Metal command buffer budget deduplicates aliased inputs") {
   const auto stream = new_stream(Device::gpu);
   auto& encoder = metal::get_command_encoder(stream);
-  const auto max_mb =
-      std::get<1>(metal::device(stream.device).get_max_ops_mb_per_buffer());
+  const auto max_mb = command_buffer_budget_mb(stream);
   REQUIRE(max_mb >= 1);
   REQUIRE(max_mb <= 256);
   const auto count = ((max_mb + 1) << 20) / (2 * sizeof(float));
